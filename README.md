@@ -21,11 +21,13 @@ docker-compose.yml
 Requires Node 20+.
 
 ```bash
-cp .env.example .env
-npm install
-bash scripts/validate.sh   # builds + tests protocol & sync service
-PORT=3000 npm run sync:dev # start sync service (in-memory store for local-network use)
+./setup-and-run.sh            # install deps, validate, build + start sync service
+./setup-and-run.sh --help     # all flags: --foreground --skip-tests --skip-linux
+                              # --skip-android --with-expo --with-postgres
+                              # --install-sys-deps --no-install --port N
 ```
+
+Manual equivalent:
 
 Postgres (optional, hosted mode): `docker compose up -d postgres` (needs Docker), set `DATABASE_URL`, apply `services/sync/migrations/001_init.sql`.
 

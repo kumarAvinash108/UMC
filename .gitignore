@@ -5,6 +5,7 @@ build/
 android/
 .expo-shared/
 *.log
+.ucm/
 .env
 .env.local
 coverage/

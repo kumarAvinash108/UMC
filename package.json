@@ -9,6 +9,7 @@
     "apps/android"
   ],
   "scripts": {
+    "setup-and-run": "bash ./setup-and-run.sh",
     "validate": "bash scripts/validate.sh",
     "protocol:test": "npm run test --workspace=@ucm/protocol",
     "sync:test": "npm run test --workspace=@ucm/sync-service",
@@ -21,5 +22,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "overrides": {
+    "react": "19.1.0",
+    "react-native": "0.81.5"
   }
 }
