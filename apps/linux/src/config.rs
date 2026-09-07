@@ -10,6 +10,16 @@ pub struct Config {
     pub poll_ms: u64,
     pub retention_days: Option<i64>, // None = never
     pub history_limit: usize,
+    // --- WiFi LAN / Bluetooth P2P transport (see docs/wifi-bluetooth.md) ---
+    /// Same-WiFi discovery + direct HTTP push (`lan.rs`).
+    pub wifi_enabled: bool,
+    /// Bluetooth framed envelopes (`bluetooth.rs`). No radio => degraded,
+    /// never fatal: daemon keeps running on WiFi/cloud.
+    pub bt_enabled: bool,
+    /// TCP port of the LAN HTTP listener (`POST /lan/v1/items`).
+    pub lan_port: u16,
+    /// UDP port for LAN discovery beacons.
+    pub discovery_port: u16,
 }
 
 impl Default for Config {
@@ -22,6 +32,10 @@ impl Default for Config {
             poll_ms: 800,
             retention_days: Some(7),
             history_limit: 1000,
+            wifi_enabled: true,
+            bt_enabled: true,
+            lan_port: 41235,
+            discovery_port: 41234,
         }
     }
 }
@@ -33,7 +47,19 @@ impl Config {
         if let Ok(v) = std::env::var("UCM_DEVICE_NAME") { c.device_name = v; }
         if let Ok(v) = std::env::var("UCM_DATA_DIR") { c.data_dir = v; }
         if let Ok(v) = std::env::var("UCM_SYNC_ENABLED") { c.sync_enabled = v != "0" && v != "false"; }
+        if let Ok(v) = std::env::var("UCM_WIFI_ENABLED") { c.wifi_enabled = !(v == "0" || v == "false"); }
+        if let Ok(v) = std::env::var("UCM_BT_ENABLED") { c.bt_enabled = !(v == "0" || v == "false"); }
+        if let Ok(v) = std::env::var("UCM_LAN_PORT") { if let Ok(p) = v.parse() { c.lan_port = p; } }
+        if let Ok(v) = std::env::var("UCM_DISCOVERY_PORT") { if let Ok(p) = v.parse() { c.discovery_port = p; } }
         c
+    }
+
+    /// Capabilities advertised on LAN beacons + cloud device registration.
+    pub fn capabilities(&self) -> Vec<String> {
+        let mut caps = Vec::new();
+        if self.wifi_enabled { caps.push("wifi-lan".to_string()); }
+        if self.bt_enabled { caps.push("bluetooth".to_string()); }
+        caps
     }
 }
 

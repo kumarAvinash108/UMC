@@ -4,6 +4,7 @@ import * as Clipboard from "expo-clipboard";
 import { Link } from "expo-router";
 import { api, wsUrl } from "../lib/api";
 import { loadIdentity } from "../lib/identity";
+import { listLanPeers } from "../lib/lan";
 import { searchRows, upsertRow, setPinned, deleteRow, type LocalRow } from "../lib/store";
 
 /**
@@ -65,6 +66,7 @@ export default function History() {
       <Text style={{ fontSize: 20, fontWeight: "600" }}>Clipboard history ({status})</Text>
       <Text style={{ color: "#666" }}>
         Android cannot monitor the clipboard in the background. Pull to refresh while the app is open, then tap an item to copy it.
+        {` `}WiFi peers: {listLanPeers().length} — add your PC's LAN IP in Settings for direct sync (no cloud round-trip).
       </Text>
       <TextInput
         placeholder="Search history…"

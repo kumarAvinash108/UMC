@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS devices (
   name TEXT NOT NULL,
   platform TEXT NOT NULL CHECK (platform IN ('linux','android')),
   public_key TEXT NOT NULL,
+  capabilities TEXT[] NOT NULL DEFAULT '{}', -- e.g. '{wifi-lan,bluetooth}'
   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   revoked_at TIMESTAMPTZ
 );
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS pairings (
   requester_public_key TEXT NOT NULL,
   requester_name TEXT NOT NULL,
   platform TEXT NOT NULL,
+  capabilities TEXT[] NOT NULL DEFAULT '{}',
   expires_at TIMESTAMPTZ NOT NULL,
   consumed_at TIMESTAMPTZ
 );

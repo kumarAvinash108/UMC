@@ -1,6 +1,6 @@
 //! `ucm` CLI: daemon + history/peer controls (tray UI hooks into the same daemon).
-use clap::{Parser, Subcommands};
-use ucm_linux::{clipboard, config::Config, db::Db, keystore, sync::Engine};
+use clap::{Parser, Subcommand};
+use ucm_linux::{bluetooth, clipboard, config::Config, db::Db, keystore, lan, sync::Engine, transport};
 
 #[derive(Parser)]
 #[command(name = "ucm", version, about = "Universal Clipboard Manager — Linux agent")]
@@ -9,7 +9,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-#[derive(Subcommands)]
+#[derive(Subcommand)]
 enum Cmd {
     /// Run the clipboard daemon (systemd --user runs this).
     Daemon,
@@ -22,6 +22,37 @@ enum Cmd {
     Resume,
     /// Wipe local keys + history (deliberate reset flow).
     Reset,
+    /// Show transport policy: WiFi LAN + Bluetooth + cloud switches.
+    Transport,
+    /// Run only the WiFi LAN listener (prints received envelope ids, never plaintext).
+    LanServe,
+    /// Listen for WiFi LAN beacons and list peers.
+    LanPeers {
+        /// Seconds to listen for beacons.
+        #[arg(long, default_value_t = 6)]
+        timeout: u64,
+    },
+    /// Encrypt TEXT with the device key and push it to one LAN peer.
+    LanSend {
+        /// Peer host (IPv4, e.g. 192.168.1.5).
+        #[arg(long)]
+        host: String,
+        /// Peer LAN TCP port.
+        #[arg(long, default_value_t = 41235)]
+        port: u16,
+        /// Plaintext to send (encrypted locally before leaving this machine).
+        text: String,
+    },
+    /// Show Bluetooth radio status + service UUIDs.
+    BtStatus,
+    /// Stage a Bluetooth envelope: encrypt TEXT and print the frame plan.
+    /// With `--tcp host:port` the frames are also written to that stream
+    /// (RFCOMM socket, L2CAP CoC, or `nc -l` in tests — same byte format).
+    BtSend {
+        text: String,
+        #[arg(long)]
+        tcp: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -33,19 +64,19 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Daemon) {
         Cmd::Daemon => {
-            let key = keystore::load_or_create_key(&cfg.data_dir)?;
+            let key = keystore::load_or_create_key(&cfg.data_dir).await?;
             let db = Db::open(&db_path)?;
             let poll = cfg.poll_ms;
             Engine::new(cfg, key)
                 .run(db, clipboard::autodetect(poll), clipboard::autodetect(poll))
                 .await
         }
-        Cmd::History => {
-            let key = keystore::load_or_create_key(&cfg.data_dir)?;
+        Cmd::History { limit } => {
+            let key = keystore::load_or_create_key(&cfg.data_dir).await?;
             let db = Db::open(&db_path)?;
             let user = db.get("user_id")?.unwrap_or_default();
             let device = db.get("device_id")?.unwrap_or_default();
-            for item in db.recent(20)? {
+            for item in db.recent(limit)? {
                 // created_at is needed for AAD; stored alongside in v1 queue rows via created_at col.
                 match ucm_linux::crypto::decrypt(&key, &item.ciphertext, &item.nonce, &item.id, &user, &device, &item.created_at) {
                     Ok(t) => println!("{}  {}", item.created_at, t.lines().next().unwrap_or_default()),
@@ -83,5 +114,199 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::Transport => {
+            let st = bluetooth::availability();
+            println!("wifi-lan:   {}", if cfg.wifi_enabled { "enabled" } else { "disabled" });
+            println!("bluetooth:  {}", if cfg.bt_enabled { "enabled" } else { "disabled" });
+            println!("cloud:      {}", if cfg.sync_enabled { "enabled" } else { "paused" });
+            println!("lan_port:   {}", cfg.lan_port);
+            println!("discovery:  udp/{}", cfg.discovery_port);
+            println!("bt_radio:   available={} powered={} ({})", st.available, st.powered, st.detail);
+            println!("bt_service: {}", bluetooth::SERVICE_UUID);
+            println!("capabilities: {:?}", cfg.capabilities());
+            println!("hint: `ucm lan-peers` scans WiFi; `ucm bt-status` details the radio.");
+            Ok(())
+        }
+        Cmd::LanServe => {
+            let db = Db::open(&db_path).unwrap_or_else(|_| Db::open_memory().expect("memdb"));
+            let device = db.get("device_id").ok().flatten().unwrap_or_else(|| "unpaired".into());
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<lan::LanEnvelope>(32);
+            let beacon = lan::local_beacon(&device, &cfg.device_name, cfg.lan_port, cfg.capabilities());
+            let reg = lan::new_registry();
+            let own = device.clone();
+            let dport = cfg.discovery_port;
+            let lport = cfg.lan_port;
+            tokio::spawn(async move { let _ = lan::announce_loop(beacon, dport).await; });
+            tokio::spawn(async move { let _ = lan::discover_loop(reg, own, dport).await; });
+            tokio::spawn(async move { let _ = lan::serve(lport, tx).await; });
+            println!("LAN serving on tcp/{lport} (device {device}). Ctrl-C to stop.");
+            while let Some(env) = rx.recv().await {
+                // Never print ciphertext or plaintext — id + sender only.
+                println!("lan rx id={} transport={} sender={}", env.item.id, env.transport, env.sender_device_id);
+            }
+            Ok(())
+        }
+        Cmd::LanPeers { timeout } => {
+            lan_peers_cli(&cfg, timeout).await
+        }
+        Cmd::LanSend { host, port, text } => {
+            lan_send_cli(&cfg, &db_path, &host, port, &text).await
+        }
+        Cmd::BtStatus => {
+            let st = bluetooth::availability();
+            println!("available: {}", st.available);
+            println!("powered:   {}", st.powered);
+            println!("detail:    {}", st.detail);
+            println!("service:   {}", bluetooth::SERVICE_UUID);
+            println!("char:      {}", bluetooth::CHAR_UUID);
+            println!("framing:   {} seq/total base64 lines, {}B chunks", bluetooth::FRAME_PREFIX, bluetooth::MTU_CHUNK);
+            println!("next: android advertises this UUID via BLE; linux `bluetoothctl power on` then pair.");
+            Ok(())
+        }
+        Cmd::BtSend { text, tcp } => {
+            bt_send_cli(&cfg, &db_path, &text, tcp.as_deref()).await
+        }
     }
+}
+
+async fn lan_peers_cli(cfg: &Config, timeout_secs: u64) -> anyhow::Result<()> {
+    let timeout = std::env::var("UCM_LAN_SCAN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(timeout_secs);
+    let _ = cfg;
+    let reg = lan::new_registry();
+    let sock = tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", lan::DISCOVERY_PORT)).await?;
+    println!("Listening for LAN beacons {timeout}s on udp/{}…", lan::DISCOVERY_PORT);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, addr))) => {
+                if let Ok(b) = serde_json::from_slice::<lan::Beacon>(&buf[..n]) {
+                    if lan::validate_beacon(&b).is_ok() {
+                        let mut reg = reg.lock().await;
+                        reg.insert(
+                            b.device_id.clone(),
+                            lan::PeerInfo {
+                                device_id: b.device_id.clone(),
+                                name: b.name.clone(),
+                                platform: b.platform.clone(),
+                                host: addr.ip().to_string(),
+                                tcp_port: b.tcp_port,
+                                capabilities: b.capabilities.clone(),
+                                fingerprint: b.fingerprint.clone(),
+                                last_seen: std::time::Instant::now(),
+                            },
+                        );
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let peers = lan::peer_list(&reg).await;
+    if peers.is_empty() {
+        println!("No peers found. Same WiFi? Is `ucm daemon`/`lan-serve` running on the other device?");
+    }
+    for p in &peers {
+        let t = transport::pick_transport(
+            &p.capabilities,
+            true,
+            &transport::TransportPolicy { wifi_enabled: true, bluetooth_enabled: true, cloud_enabled: true },
+        );
+        println!(
+            "{} {} {}:{} caps={:?} via={} ",
+            p.device_id,
+            p.name,
+            p.host,
+            p.tcp_port,
+            p.capabilities,
+            t.map(|t| t.to_string()).unwrap_or_else(|| "none".into())
+        );
+    }
+    Ok(())
+}
+
+async fn lan_send_cli(cfg: &Config, db_path: &str, host: &str, port: u16, text: &str) -> anyhow::Result<()> {
+    let key = keystore::load_or_create_key(&cfg.data_dir).await?;
+    let db = Db::open(db_path)?;
+    let user = db.get("user_id")?.unwrap_or_else(|| "lan-local".into());
+    let device = db.get("device_id")?.unwrap_or_else(|| "lan-local-device".into());
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let (ciphertext, nonce) = ucm_linux::crypto::encrypt(&key, text, &id, &user, &device, &created_at)?;
+    let env = lan::LanEnvelope::new_wifi(
+        &device,
+        &cfg.device_name,
+        lan::LanItem {
+            id: id.clone(),
+            owner_id: user,
+            source_device_id: device.clone(),
+            content_type: "text/plain".into(),
+            ciphertext,
+            nonce,
+            metadata: serde_json::json!({}),
+            created_at,
+            expires_at: None,
+            deleted_at: None,
+        },
+    );
+    lan::validate_envelope(&env)?;
+    let peer = lan::PeerInfo {
+        device_id: format!("manual:{host}:{port}"),
+        name: "manual".into(),
+        platform: "unknown".into(),
+        host: host.into(),
+        tcp_port: port,
+        capabilities: vec!["wifi-lan".into()],
+        fingerprint: None,
+        last_seen: std::time::Instant::now(),
+    };
+    lan::push_to_peer(&peer, &env).await?;
+    println!("sent {id} to {host}:{port} (ciphertext only, {}B)", text.len());
+    Ok(())
+}
+
+async fn bt_send_cli(cfg: &Config, db_path: &str, text: &str, tcp: Option<&str>) -> anyhow::Result<()> {
+    let key = keystore::load_or_create_key(&cfg.data_dir).await?;
+    let db = Db::open(db_path)?;
+    let user = db.get("user_id")?.unwrap_or_else(|| "bt-local".into());
+    let device = db.get("device_id")?.unwrap_or_else(|| "bt-local-device".into());
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let (ciphertext, nonce) = ucm_linux::crypto::encrypt(&key, text, &id, &user, &device, &created_at)?;
+    let env = lan::LanEnvelope {
+        v: 1,
+        transport: "bluetooth".into(),
+        sender_device_id: device,
+        sender_name: Some(cfg.device_name.clone()),
+        item: lan::LanItem {
+            id: id.clone(),
+            owner_id: user,
+            source_device_id: "bt-local-device".into(),
+            content_type: "text/plain".into(),
+            ciphertext,
+            nonce,
+            metadata: serde_json::json!({}),
+            created_at,
+            expires_at: None,
+            deleted_at: None,
+        },
+    };
+    let frames = bluetooth::encode_frames(&env)?;
+    println!("staged bt envelope {id} as {} frame(s) (service {})", frames.len(), bluetooth::SERVICE_UUID);
+    if let Some(addr) = tcp {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        let n = bluetooth::send_over_stream(&mut stream, &env).await?;
+        println!("wrote {n} frame(s) to {addr}");
+    } else {
+        println!("preview: {}", frames.first().map(|f| f.chars().take(64).collect::<String>()).unwrap_or_default());
+        println!("hint: `ucm bt-send --tcp <host:port> \"text\"` writes the same bytes an RFCOMM socket would carry.");
+    }
+    Ok(())
 }

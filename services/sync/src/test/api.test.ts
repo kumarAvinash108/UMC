@@ -107,4 +107,18 @@ describe("sync service v1", () => {
     const blocked = await api("/items", { token: s.token });
     assert.equal(blocked.res.status, 403); // revoked session token
   });
+
+  it("devices advertise wifi-lan/bluetooth capabilities for P2P transport", async () => {
+    const s = (await api("/auth/session", { method: "POST", body: "{}" })).body as { token: string };
+    const d = (
+      await api("/devices", {
+        method: "POST",
+        token: s.token,
+        body: JSON.stringify({ name: "pc", platform: "linux", public_key: "pk", capabilities: ["wifi-lan", "bluetooth", "nfc"] }),
+      })
+    ).body as { capabilities: string[] };
+    assert.deepEqual(d.capabilities, ["wifi-lan", "bluetooth"]); // unknown filtered
+    const list = (await api("/devices", { token: s.token })).body as { devices: { capabilities: string[] }[] };
+    assert.deepEqual(list.devices[0].capabilities, ["wifi-lan", "bluetooth"]);
+  });
 });

@@ -45,8 +45,8 @@ async function req(path: string, token: string | null, init: RequestInit = {}) {
 export const api = {
   createSession: (user_id?: string): Promise<{ user_id: string; token: string }> =>
     req("/auth/session", null, { method: "POST", body: JSON.stringify({ user_id }) }),
-  registerDevice: (token: string, name: string, platform: "android" | "linux", public_key: string) =>
-    req("/devices", token, { method: "POST", body: JSON.stringify({ name, platform, public_key }) }),
+  registerDevice: (token: string, name: string, platform: "android" | "linux", public_key: string, capabilities: string[] = ["wifi-lan", "bluetooth"]) =>
+    req("/devices", token, { method: "POST", body: JSON.stringify({ name, platform, public_key, capabilities }) }),
   listDevices: (token: string) => req("/devices", token),
   revokeDevice: (token: string, id: string) => req(`/devices/${id}/revoke`, token, { method: "POST" }),
   requestPairing: (token: string, body: object) => req("/pairing/request", token, { method: "POST", body: JSON.stringify(body) }),

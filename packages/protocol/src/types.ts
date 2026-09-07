@@ -4,6 +4,9 @@ export const PROTOCOL_VERSION = 1;
 export type Platform = "linux" | "android" | "unknown";
 export type ContentType = "text/plain";
 
+/** Peer-to-peer transports a device can speak (see lan.ts). */
+export type P2PCapability = "wifi-lan" | "bluetooth";
+
 export interface Device {
   id: string;
   user_id: string;
@@ -11,6 +14,8 @@ export interface Device {
   platform: Platform;
   /** base64-encoded X25519/Ed25519 public key (opaque to server) */
   public_key: string;
+  /** P2P transports for direct sync (wifi-lan / bluetooth); cloud is implicit. */
+  capabilities: P2PCapability[];
   last_seen_at: string;
   revoked_at: string | null;
 }

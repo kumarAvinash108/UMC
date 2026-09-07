@@ -29,7 +29,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-secret-service = "4"
+secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 arboard = "3"
 async-trait = "0.1"
 

@@ -2,9 +2,19 @@ import { useEffect, useState } from "react";
 import { View, Text, Pressable, FlatList, Alert } from "react-native";
 import { api } from "../lib/api";
 import { loadIdentity } from "../lib/identity";
+import { pickTransport, type CloudPeer } from "../lib/transport";
+
+interface Row { id: string; name: string; platform: string; revoked_at: string | null; capabilities?: string[] }
+
+function transportLabel(d: Row): string {
+  const t = pickTransport(d.capabilities ?? [], (d.capabilities ?? []).includes("wifi-lan"), {
+    wifiEnabled: true, bluetoothEnabled: true, cloudEnabled: true,
+  });
+  return t ?? "none";
+}
 
 export default function Devices() {
-  const [devices, setDevices] = useState<{ id: string; name: string; platform: string; revoked_at: string | null }[]>([]);
+  const [devices, setDevices] = useState<Row[]>([]);
 
   async function load() {
     const id = await loadIdentity();
@@ -24,8 +34,11 @@ export default function Devices() {
         ListEmptyComponent={<Text>No devices yet.</Text>}
         renderItem={({ item }) => (
           <View style={{ padding: 12, borderWidth: 1, borderRadius: 8, marginBottom: 8 }}>
-            <Text>{item.name} ({item.platform})</Text>
+            <Text>{item.name} ({item.platform}) · via {transportLabel(item)}</Text>
             <Text style={{ color: "#888", fontSize: 12 }}>{item.id}</Text>
+            {(item.capabilities?.length ?? 0) > 0 && (
+              <Text style={{ color: "#666", fontSize: 12 }}>caps: {item.capabilities!.join(", ")}</Text>
+            )}
             {item.revoked_at ? (
               <Text style={{ color: "red" }}>Revoked</Text>
             ) : (

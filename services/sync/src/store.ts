@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ClipboardItem, Device, Platform, SyncEvent } from "@ucm/protocol";
+import type { ClipboardItem, Device, P2PCapability, Platform, SyncEvent } from "@ucm/protocol";
 import { compareItems, decodeCursor, encodeCursor } from "@ucm/protocol";
 import { createHash, randomInt } from "node:crypto";
 
@@ -16,6 +16,7 @@ export interface PairingEntry {
   requester_public_key: string;
   requester_name: string;
   platform: Platform;
+  capabilities: P2PCapability[];
   user_id: string; // approver's account (pairing is per-user)
   expires_at: string;
   consumed_at: string | null;
@@ -29,7 +30,7 @@ export interface Store {
   createSession(user_id: string): Session;
   getSession(token: string): Session | undefined;
   bindSessionDevice(token: string, device_id: string): void;
-  createDevice(user_id: string, name: string, platform: Platform, public_key: string): Device;
+  createDevice(user_id: string, name: string, platform: Platform, public_key: string, capabilities?: P2PCapability[]): Device;
   listDevices(user_id: string): Device[];
   revokeDevice(user_id: string, device_id: string): Device | undefined;
   isRevoked(user_id: string, device_id: string): boolean;
@@ -37,7 +38,7 @@ export interface Store {
   listItems(user_id: string, cursor: string | undefined, limit: number): { items: ClipboardItem[]; next_cursor: string | null };
   deleteItem(user_id: string, id: string): ClipboardItem | undefined;
   ackItem(user_id: string, device_id: string, id: string): boolean;
-  createPairing(user_id: string, req: { requester_public_key: string; requester_name: string; platform: Platform }): { entry: PairingEntry; code: string };
+  createPairing(user_id: string, req: { requester_public_key: string; requester_name: string; platform: Platform; capabilities?: P2PCapability[] }): { entry: PairingEntry; code: string };
   confirmPairing(user_id: string, code: string): PairingEntry | undefined;
   sweepExpired(): number;
   counts(): { users: number; devices: number; items: number };
@@ -77,9 +78,9 @@ export class MemoryStore implements Store {
     const s = this.sessions.get(token);
     if (s) s.device_id = device_id;
   }
-  createDevice(user_id: string, name: string, platform: Platform, public_key: string): Device {
+  createDevice(user_id: string, name: string, platform: Platform, public_key: string, capabilities: P2PCapability[] = []): Device {
     const now = new Date().toISOString();
-    const d: Device = { id: randomUUID(), user_id, name, platform, public_key, last_seen_at: now, revoked_at: null };
+    const d: Device = { id: randomUUID(), user_id, name, platform, public_key, capabilities, last_seen_at: now, revoked_at: null };
     this.devices.set(d.id, d);
     return d;
   }
@@ -142,7 +143,7 @@ export class MemoryStore implements Store {
     return true;
   }
 
-  createPairing(user_id: string, req: { requester_public_key: string; requester_name: string; platform: Platform }) {
+  createPairing(user_id: string, req: { requester_public_key: string; requester_name: string; platform: Platform; capabilities?: P2PCapability[] }) {
     // 6-digit code; only hash is stored
     const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
     const code_hash = createHash("sha256").update(code).digest("hex");
@@ -152,6 +153,7 @@ export class MemoryStore implements Store {
       requester_public_key: req.requester_public_key,
       requester_name: req.requester_name,
       platform: req.platform,
+      capabilities: req.capabilities ?? [],
       user_id,
       expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
       consumed_at: null,

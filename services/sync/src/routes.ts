@@ -3,7 +3,12 @@ import { randomUUID } from "node:crypto";
 import { LIMITS, validateItemUpload } from "@ucm/protocol";
 import type { Broadcast, Store } from "./store.js";
 import { authMiddleware, type AuthedRequest } from "./auth.js";
-import type { ClipboardItem } from "@ucm/protocol";
+import type { ClipboardItem, P2PCapability } from "@ucm/protocol";
+
+function parseCapabilities(v: unknown): P2PCapability[] {
+  if (!Array.isArray(v)) return [];
+  return (v as unknown[]).filter((c) => c === "wifi-lan" || c === "bluetooth") as P2PCapability[];
+}
 
 export function buildRouter(store: Store, broadcast: Broadcast, cfg: { maxItemBytes: number; defaultExpiryDays: number; maxPage: number }) {
   const r = Router();
@@ -26,14 +31,14 @@ export function buildRouter(store: Store, broadcast: Broadcast, cfg: { maxItemBy
   // ---- devices ----
   r.post("/devices", authed, (req, res) => {
     const { user_id, session_token } = req as unknown as AuthedRequest;
-    const { name, platform, public_key } = (req.body ?? {}) as Record<string, string>;
-    if (!name || typeof name !== "string" || name.length > 64)
+    const { name, platform, public_key, capabilities } = (req.body ?? {}) as Record<string, unknown>;
+    if (!name || typeof name !== "string" || (name as string).length > 64)
       { res.status(400).json({ error: "name required (<=64)" }); return; }
     if (platform !== "linux" && platform !== "android")
       { res.status(400).json({ error: "platform must be linux|android" }); return; }
-    if (!public_key || typeof public_key !== "string" || public_key.length > 512)
+    if (!public_key || typeof public_key !== "string" || (public_key as string).length > 512)
       { res.status(400).json({ error: "public_key required" }); return; }
-    const d = store.createDevice(user_id, name, platform, public_key);
+    const d = store.createDevice(user_id, name as string, platform, public_key as string, parseCapabilities(capabilities));
     store.bindSessionDevice(session_token, d.id);
     res.status(201).json(d);
   });
@@ -53,13 +58,14 @@ export function buildRouter(store: Store, broadcast: Broadcast, cfg: { maxItemBy
   // ---- pairing (short code, hash stored, 10-min expiry, single use) ----
   r.post("/pairing/request", authed, (req, res) => {
     const { user_id } = req as unknown as AuthedRequest;
-    const { requester_public_key, requester_name, platform } = (req.body ?? {}) as Record<string, string>;
+    const { requester_public_key, requester_name, platform, capabilities } = (req.body ?? {}) as Record<string, unknown>;
     if (!requester_public_key || !requester_name)
       { res.status(400).json({ error: "requester_public_key + requester_name required" }); return; }
     if (platform !== "linux" && platform !== "android")
       { res.status(400).json({ error: "platform must be linux|android" }); return; }
     const { entry, code } = store.createPairing(user_id, {
-      requester_public_key, requester_name, platform,
+      requester_public_key: requester_public_key as string, requester_name: requester_name as string, platform,
+      capabilities: parseCapabilities(capabilities),
     });
     // Code is returned once to the requester display; server keeps only the hash.
     res.status(201).json({ code, expires_at: entry.expires_at, code_hint: entry.code_hint });
@@ -71,7 +77,7 @@ export function buildRouter(store: Store, broadcast: Broadcast, cfg: { maxItemBy
     if (!code) { res.status(400).json({ error: "code required" }); return; }
     const entry = store.confirmPairing(user_id, code);
     if (!entry) { res.status(400).json({ error: "invalid or expired code" }); return; }
-    const d = store.createDevice(user_id, String(device_name ?? entry.requester_name).slice(0, 64), entry.platform, entry.requester_public_key);
+    const d = store.createDevice(user_id, String(device_name ?? entry.requester_name).slice(0, 64), entry.platform, entry.requester_public_key, entry.capabilities);
     res.status(201).json({ device: d, fingerprint: "sha256:" + Buffer.from(entry.requester_public_key).toString("base64").slice(0, 16) });
   });
 
