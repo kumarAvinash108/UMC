@@ -2,7 +2,10 @@ node_modules/
 dist/
 build/
 .expo/
-android/
+# Expo-generated native projects only (NOTE: bare `android/` would also match
+# apps/android/, hiding the whole Expo app from git — scope it instead).
+apps/android/android/
+apps/android/ios/
 .expo-shared/
 *.log
 .ucm/
