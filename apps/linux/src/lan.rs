@@ -239,24 +239,83 @@ pub async fn discover_loop(registry: PeerRegistry, own_device_id: String, discov
 // Sync: minimal HTTP listener (tokio only) + push client
 // ---------------------------------------------------------------------------
 
-/// Serve `GET /lan/v1/health` and `POST /lan/v1/items`. Valid envelopes are
-/// forwarded to `tx` for the sync engine to decrypt + apply; the listener
-/// itself never sees plaintext.
-pub async fn serve(tcp_port: u16, tx: mpsc::Sender<LanEnvelope>) -> Result<()> {
+/// Serve the LAN API off the local replica database (`db_path`):
+/// - `GET /lan/v1/health` — presence check for pollers.
+/// - `POST /lan/v1/items` — accept an envelope; valid ones are forwarded to
+///   `tx` for the sync engine to decrypt + apply + store.
+/// - `GET /lan/v1/items?since=<ts>&since_id=<id>&limit=<n>` — servable slice
+///   of the replica (ciphertext only) so phones can poll without any cloud.
+/// The listener itself never sees plaintext.
+pub async fn serve(tcp_port: u16, tx: mpsc::Sender<LanEnvelope>, db_path: String) -> Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{tcp_port}")).await?;
     info!(port = tcp_port, "lan http listening");
     loop {
         let (stream, addr) = listener.accept().await?;
         let tx = tx.clone();
+        let db_path = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, &tx).await {
+            if let Err(e) = handle_conn(stream, &tx, &db_path).await {
                 warn!(peer = %addr, error = %e, "lan conn failed");
             }
         });
     }
 }
 
-async fn handle_conn(mut stream: tokio::net::TcpStream, tx: &mpsc::Sender<LanEnvelope>) -> Result<()> {
+/// Minimal percent-decoder for query values (enough for ISO timestamps).
+fn pct_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.as_bytes().iter();
+    while let Some(&b) = it.next() {
+        if b == b'%' {
+            let hi = it.next().copied().unwrap_or(b'0');
+            let lo = it.next().copied().unwrap_or(b'0');
+            let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            out.push((hex(hi) << 4 | hex(lo)) as char);
+        } else if b == b'+' {
+            out.push(' ');
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(pct_decode(v));
+            }
+        }
+    }
+    None
+}
+
+/// Build servable envelopes from replica rows (ciphertext untouched).
+fn envelopes_for(rows: &[crate::db::LocalItem]) -> Vec<LanEnvelope> {
+    rows.iter()
+        .map(|r| LanEnvelope {
+            v: 1,
+            transport: "wifi".into(),
+            sender_device_id: r.source_device_id.clone(),
+            sender_name: None,
+            item: LanItem {
+                id: r.id.clone(),
+                owner_id: r.owner_id.clone(),
+                source_device_id: r.source_device_id.clone(),
+                content_type: "text/plain".into(),
+                ciphertext: r.ciphertext.clone(),
+                nonce: r.nonce.clone(),
+                metadata: serde_json::json!({}),
+                created_at: r.created_at.clone(),
+                expires_at: None,
+                deleted_at: None,
+            },
+        })
+        .collect()
+}
+
+async fn handle_conn(mut stream: tokio::net::TcpStream, tx: &mpsc::Sender<LanEnvelope>, db_path: &str) -> Result<()> {
     let mut buf = vec![0u8; 128 * 1024];
     let n = stream.read(&mut buf).await.context("read request")?;
     if n == 0 {
@@ -289,6 +348,18 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, tx: &mpsc::Sender<LanEnv
 
     let (status, payload) = if request_line.starts_with("GET ") && request_line.contains(HEALTH_PATH) {
         ("200 OK", serde_json::json!({"ok": true, "service": SERVICE_TYPE}).to_string())
+    } else if request_line.starts_with("GET ") && request_line.contains(HTTP_PATH) {
+        // Replica poll: /lan/v1/items?since=<ts>&since_id=<id>&limit=<n>
+        let query = request_line.split_whitespace().nth(1).unwrap_or_default()
+            .split_once('?').map(|(_, q)| q).unwrap_or_default().to_string();
+        let since = query_param(&query, "since").unwrap_or_default();
+        let since_id = query_param(&query, "since_id").unwrap_or_default();
+        let limit: usize = query_param(&query, "limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+        let cursor = if since.is_empty() { None } else { Some((since.as_str(), since_id.as_str())) };
+        match crate::db::Db::open(db_path).map(|db| db.list_since(cursor, limit)) {
+            Ok(Ok(rows)) => ("200 OK", serde_json::json!({"items": envelopes_for(&rows)}).to_string()),
+            Ok(Err(e)) | Err(e) => ("500 Internal Server Error", format!(r#"{{"error":"db: {e}"}}"#)),
+        }
     } else if request_line.starts_with("POST ") && request_line.contains(HTTP_PATH) {
         match serde_json::from_slice::<LanEnvelope>(&body) {
             Ok(env) if validate_envelope(&env).is_ok() => {
@@ -314,6 +385,22 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, tx: &mpsc::Sender<LanEnv
     Ok(())
 }
 
+/// Replica row from a validated inbound envelope (ciphertext untouched).
+/// Used by the engine and `lan-serve` so every Linux node serves the full
+/// mesh history to LAN pollers (phones).
+pub fn to_local_item(env: &LanEnvelope, uploaded: bool) -> crate::db::LocalItem {
+    crate::db::LocalItem {
+        id: env.item.id.clone(),
+        ciphertext: env.item.ciphertext.clone(),
+        nonce: env.item.nonce.clone(),
+        created_at: env.item.created_at.clone(),
+        owner_id: env.item.owner_id.clone(),
+        source_device_id: env.item.source_device_id.clone(),
+        uploaded,
+        pinned: false,
+    }
+}
+
 /// Push one envelope to a single peer (fire-and-forget from the engine).
 pub async fn push_to_peer(peer: &PeerInfo, env: &LanEnvelope) -> Result<()> {
     let client = reqwest::Client::new();
@@ -328,8 +415,9 @@ pub async fn push_to_peer(peer: &PeerInfo, env: &LanEnvelope) -> Result<()> {
 }
 
 /// Broadcast to all live WiFi peers; returns (delivered, attempted).
-/// Delivery errors are logged, never fatal — cloud/offline queue is the
-/// backstop, so a sleeping phone must not break local capture.
+/// Delivery errors are logged, never fatal — a sleeping peer just misses
+/// this push and catches up on its next `GET /lan/v1/items` poll, and every
+/// Linux node keeps a full replica so any of them can serve it.
 pub async fn broadcast(registry: &PeerRegistry, env: &LanEnvelope) -> (usize, usize) {
     let peers: Vec<PeerInfo> = {
         let mut reg = registry.lock().await;
@@ -401,12 +489,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_and_push_roundtrip() {
+    async fn serve_push_and_poll_roundtrip() {
         let (tx, mut rx) = mpsc::channel::<LanEnvelope>(8);
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db").to_string_lossy().to_string();
+        // Seed the replica with one servable row.
+        {
+            let db = crate::db::Db::open(&db_path).unwrap();
+            db.insert(&crate::db::LocalItem {
+                id: "123e4567-e89b-12d3-a456-426614174000".into(),
+                ciphertext: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"secret"),
+                nonce: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"123456789012"),
+                created_at: "2024-01-01T00:00:00.000Z".into(),
+                owner_id: "u1".into(), source_device_id: "d1".into(),
+                uploaded: true, pinned: false,
+            }).unwrap();
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let srv = tokio::spawn(serve(port, tx));
+        let srv = tokio::spawn(serve(port, tx, db_path));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let env = envelope();
         let peer = PeerInfo {
@@ -419,9 +521,23 @@ mod tests {
             fingerprint: None,
             last_seen: std::time::Instant::now(),
         };
+        // POST path: envelope forwarded to the engine channel.
         push_to_peer(&peer, &env).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
         assert_eq!(got.item.id, env.item.id);
+        // GET path: replica poll returns the seeded row as an envelope.
+        let client = reqwest::Client::new();
+        let page: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}{HTTP_PATH}?limit=50"))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["item"]["ciphertext"], env.item.ciphertext);
+        // Cursor past it yields nothing.
+        let page2: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}{HTTP_PATH}?since=2024-01-01T00%3A00%3A00.000Z&since_id=123e4567-e89b-12d3-a456-426614174000"))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert!(page2["items"].as_array().unwrap().is_empty());
         srv.abort();
     }
 }

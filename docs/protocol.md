@@ -15,7 +15,10 @@
 2. For each copy: fresh 96-bit nonce, `ciphertext = AES-GCM-256(key, nonce, plaintext, aad)`.
 3. **AAD** (authenticated, prevents id/device/timestamp swapping):
    `{"v":1,"id","owner_id","source_device_id","content_type","created_at"}`.
-4. Upload `{id, content_type, ciphertext, nonce, metadata, expires_at}` — server validates shape/size only, **never decrypts**.
+4. Upload `{id, content_type, ciphertext, nonce, metadata, expires_at, created_at}` — server validates shape/size only, **never decrypts**.
+   `created_at` is bound into the AAD, so clients MUST send the exact timestamp
+   used at encrypt time and the server preserves it verbatim (older clients that
+   omit it get a server stamp).
 5. Reference implementations: `packages/protocol/src/crypto.ts` (Node/WebCrypto-compatible layout) and `apps/linux/src/crypto.rs` (aes-gcm crate). Android production path should use the same AAD bytes.
 
 ## Ordering & pagination

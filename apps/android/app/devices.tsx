@@ -27,10 +27,11 @@ export default function Devices() {
 
   return (
     <View style={{ flex: 1, padding: 16, gap: 12 }}>
-      <Text style={{ fontSize: 20, fontWeight: "600" }}>Devices</Text>
       <FlatList
         data={devices}
         keyExtractor={(d) => d.id}
+        contentContainerStyle={{ paddingBottom: 24 }}
+        ListHeaderComponent={<Text style={{ fontSize: 20, fontWeight: "600", marginBottom: 12 }}>Devices</Text>}
         ListEmptyComponent={<Text>No devices yet.</Text>}
         renderItem={({ item }) => (
           <View style={{ padding: 12, borderWidth: 1, borderRadius: 8, marginBottom: 8 }}>

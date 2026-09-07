@@ -41,6 +41,46 @@ fn attrs() -> HashMap<&'static str, &'static str> {
     HashMap::from([("service", SERVICE), ("account", ACCOUNT)])
 }
 
+/// Base64 of the device key, for `ucm key-show` (copy into the phone's
+/// Settings → Sync key). The key NEVER leaves this machine except through
+/// this explicit user action — it is never uploaded to the sync service.
+pub async fn show_key_b64(data_dir: &str) -> anyhow::Result<String> {
+    let k = load_or_create_key(data_dir).await?;
+    Ok(B64.encode(k))
+}
+
+/// Short fingerprint for visual verification. MUST match the fingerprint
+/// shown in the Android app (`keyFingerprint` in `lib/crypto.ts`).
+pub fn fingerprint_b64(key_b64: &str) -> String {
+    let t = key_b64.trim();
+    if t.len() < 12 {
+        return "invalid".into();
+    }
+    format!("{}…{}", &t[..8], &t[t.len() - 4..])
+}
+
+/// Replace the device key (to adopt a key shared from another device).
+/// Old local history becomes undecryptable — that is expected, since the
+/// old key is gone; new copies will sync with the shared key.
+pub async fn import_key_b64(data_dir: &str, key_b64: &str) -> anyhow::Result<()> {
+    let raw = B64.decode(key_b64.trim())?;
+    if raw.len() != 32 {
+        anyhow::bail!("key must decode to exactly 32 bytes");
+    }
+    std::fs::create_dir_all(data_dir)?;
+    let path = format!("{data_dir}/device.key");
+    std::fs::write(&path, &raw)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&raw);
+    let _ = to_secret_service(&k).await;
+    Ok(())
+}
+
 async fn from_secret_service() -> anyhow::Result<[u8; 32]> {
     let ss = secret_service::SecretService::connect(secret_service::EncryptionType::Dh).await?;
     let col = ss.get_default_collection().await?;

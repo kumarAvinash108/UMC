@@ -20,6 +20,10 @@ pub struct Config {
     pub lan_port: u16,
     /// UDP port for LAN discovery beacons.
     pub discovery_port: u16,
+    /// Cloud relay (account sessions, off-LAN sync). OFF by default: the
+    /// mesh works fully offline. Set `UCM_CLOUD_ENABLED=true` only when the
+    /// sync service should relay for devices off the LAN.
+    pub cloud_enabled: bool,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             bt_enabled: true,
             lan_port: 41235,
             discovery_port: 41234,
+            cloud_enabled: false,
         }
     }
 }
@@ -51,6 +56,7 @@ impl Config {
         if let Ok(v) = std::env::var("UCM_BT_ENABLED") { c.bt_enabled = !(v == "0" || v == "false"); }
         if let Ok(v) = std::env::var("UCM_LAN_PORT") { if let Ok(p) = v.parse() { c.lan_port = p; } }
         if let Ok(v) = std::env::var("UCM_DISCOVERY_PORT") { if let Ok(p) = v.parse() { c.discovery_port = p; } }
+        if let Ok(v) = std::env::var("UCM_CLOUD_ENABLED") { c.cloud_enabled = !(v == "0" || v == "false" || v.is_empty()); }
         c
     }
 

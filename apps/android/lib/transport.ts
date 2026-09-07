@@ -8,6 +8,7 @@
 import { healthCheck, listLanPeers, pushEnvelope, type LanPeer, type WifiEnvelope } from "./lan";
 import { getBtStatus, sendEnvelopeViaBt, btOutbox, type BtEnvelope } from "./bluetooth";
 import { api } from "./api";
+import * as SecureStore from "expo-secure-store";
 
 export type Transport = "wifi" | "bluetooth" | "cloud";
 
@@ -20,8 +21,20 @@ export interface TransportPolicy {
 export const DEFAULT_POLICY: TransportPolicy = {
   wifiEnabled: true,
   bluetoothEnabled: true,
-  cloudEnabled: true,
+  // Direct LAN/BT mesh is the default; the cloud relay is opt-in
+  // (Settings → Cloud relay) for devices off the LAN.
+  cloudEnabled: false,
 };
+
+/** Policy toggles persisted by the Settings screen (wifi/bt on, cloud off unless enabled). */
+export async function loadPolicy(): Promise<TransportPolicy> {
+  const [w, b, c] = await Promise.all([
+    SecureStore.getItemAsync("ucm.wifi"),
+    SecureStore.getItemAsync("ucm.bt"),
+    SecureStore.getItemAsync("ucm.cloud"),
+  ]);
+  return { wifiEnabled: w !== "0", bluetoothEnabled: b !== "0", cloudEnabled: c === "1" };
+}
 
 export interface CloudPeer {
   id: string;
@@ -160,6 +173,8 @@ export async function fanOut(
         ciphertext: payload.ciphertext,
         nonce: payload.nonce,
         metadata: payload.metadata,
+        // AAD-bound: server preserves it verbatim so peers can decrypt.
+        created_at: payload.created_at,
       });
       cloud = true;
     } catch (e) {

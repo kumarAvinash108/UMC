@@ -1,6 +1,11 @@
-//! Sync engine: cloud relay + WiFi LAN + Bluetooth fan-out, loop prevention.
+//! Sync engine: WiFi LAN mesh + Bluetooth fan-out + optional cloud relay.
 //!
-//! Transport priority is wifi-lan → bluetooth → cloud (see `transport.rs`).
+//! Default mode is **direct LAN sync, no cloud**: every Linux node keeps a
+//! full ciphertext replica and serves it (`GET /lan/v1/items`), phones push
+//! to it and poll it, and Linux nodes relay for each other. Identity in this
+//! mode is derived from the shared sync key (`lan_owner_id`), so no account
+//! server is needed at all. The cloud relay (`UCM_CLOUD_ENABLED=true`) is an
+//! opt-in backstop for devices off the LAN.
 //! Every transport carries the same E2E ciphertext; the engine decrypts only
 //! on apply, so LAN/BT peers and the server all stay opaque to contents.
 use futures_util::StreamExt;
@@ -23,6 +28,40 @@ pub struct SessionState {
     pub user_id: String,
     pub token: String,
     pub device_id: String,
+}
+
+/// Key-derived owner id for serverless LAN mode. Deterministic in the shared
+/// sync key, so every device holding the same key lands in the same owner
+/// namespace with zero coordination. MUST match `lanOwnerId` in
+/// `apps/android/lib/crypto.ts`: `local-` + STANDARD-base64(key) with `=`
+/// stripped and `+/` mapped to `-_` (URL-safe, no padding).
+pub fn lan_owner_id(key: &[u8; 32]) -> String {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let clean: String = B64
+        .encode(key)
+        .chars()
+        .filter(|&c| c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    format!("local-{clean}")
+}
+
+/// Serverless session: owner derived from the key, device id persisted in
+/// the local db (stable across restarts so loop-prevention holds).
+pub fn local_session(db: &Db, key: &[u8; 32]) -> anyhow::Result<SessionState> {
+    let device_id = match db.get("device_id")? {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            db.set("device_id", &id)?;
+            id
+        }
+    };
+    Ok(SessionState { user_id: lan_owner_id(key), token: String::new(), device_id })
 }
 
 pub struct Engine {
@@ -77,11 +116,10 @@ impl Engine {
         Ok(SessionState { user_id, token, device_id })
     }
 
-    /// Handle a local clipboard change: encrypt + queue + fan out.
-    /// Fan-out order: cloud upload (if enabled) then WiFi LAN broadcast.
-    /// Bluetooth sending is staged via `bt_send_hint`: v1 logs the framed
-    /// size and relies on the connected RFCOMM/GATT stream (see
-    /// `bluetooth::send_over_stream`) — the envelope bytes are identical.
+    /// Handle a local clipboard change: encrypt + store + fan out.
+    /// Fan-out order: WiFi LAN broadcast, Bluetooth staging, then cloud
+    /// upload (only when `UCM_CLOUD_ENABLED=true`). The global pause switch
+    /// (`sync_enabled`) gates every transport; capture always continues.
     pub async fn on_local_copy(&self, db: &Db, sess: &SessionState, text: ClipboardText) -> anyhow::Result<()> {
         {
             let shared = self.shared.lock().await;
@@ -93,18 +131,22 @@ impl Engine {
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let (ciphertext, nonce) = crypto::encrypt(&self.key, &text.0, &id, &sess.user_id, &sess.device_id, &created_at)?;
-        db.insert(&crate::db::LocalItem { id: id.clone(), ciphertext: ciphertext.clone(), nonce: nonce.clone(), created_at: created_at.clone(), uploaded: false, pinned: false })?;
+        db.insert(&crate::db::LocalItem {
+            id: id.clone(), ciphertext: ciphertext.clone(), nonce: nonce.clone(),
+            created_at: created_at.clone(), owner_id: sess.user_id.clone(),
+            source_device_id: sess.device_id.clone(), uploaded: false, pinned: false,
+        })?;
         {
             let mut shared = self.shared.lock().await;
             shared.seen_ids.insert(id.clone());
             shared.last_local_text = Some(text.0);
         }
-        if self.cfg.sync_enabled {
-            self.upload_with_backoff(sess, &id, &ciphertext, &nonce).await?;
+        if self.cfg.cloud_enabled && self.cfg.sync_enabled {
+            self.upload_with_backoff(sess, &id, &ciphertext, &nonce, &created_at).await?;
             db.mark_uploaded(&id)?;
         }
-        // WiFi LAN fan-out (best-effort; cloud/offline queue is the backstop).
-        if self.cfg.wifi_enabled {
+        // WiFi LAN fan-out (best-effort; missed peers catch up via replica poll).
+        if self.cfg.wifi_enabled && self.cfg.sync_enabled {
             if let Some(reg) = self.lan_peers.clone() {
                 let env = LanEnvelope::new_wifi(
                     &sess.device_id,
@@ -128,7 +170,7 @@ impl Engine {
                 }
             }
         }
-        if self.cfg.bt_enabled {
+        if self.cfg.bt_enabled && self.cfg.sync_enabled {
             // Framing check now; actual radio write happens on the connected
             // stream. Keeps a misconfigured BT stack from breaking capture.
             let bt_env = LanEnvelope {
@@ -157,12 +199,15 @@ impl Engine {
         Ok(())
     }
 
-    async fn upload_with_backoff(&self, sess: &SessionState, id: &str, ciphertext: &str, nonce: &str) -> anyhow::Result<()> {
+    async fn upload_with_backoff(&self, sess: &SessionState, id: &str, ciphertext: &str, nonce: &str, created_at: &str) -> anyhow::Result<()> {
         let mut delay = Duration::from_millis(500);
         for attempt in 0..6 {
             let r = self.http.post(format!("{}/v1/items", self.base()))
                 .bearer_auth(&sess.token)
-                .json(&serde_json::json!({"id": id, "content_type": "text/plain", "ciphertext": ciphertext, "nonce": nonce, "metadata": {}}))
+                // created_at MUST be sent: it is bound into the AES-GCM AAD at
+                // encrypt time and the server preserves it verbatim so other
+                // devices can decrypt.
+                .json(&serde_json::json!({"id": id, "content_type": "text/plain", "ciphertext": ciphertext, "nonce": nonce, "metadata": {}, "created_at": created_at}))
                 .send().await;
             match r {
                 Ok(resp) if resp.status().is_success() => return Ok(()),
@@ -180,7 +225,7 @@ impl Engine {
         let pending = db.pending()?;
         let mut n = 0;
         for item in pending {
-            match self.upload_with_backoff(sess, &item.id, &item.ciphertext, &item.nonce).await {
+            match self.upload_with_backoff(sess, &item.id, &item.ciphertext, &item.nonce, &item.created_at).await {
                 Ok(()) => { db.mark_uploaded(&item.id)?; n += 1; }
                 Err(e) => { warn!(id = %item.id, error = %e, "flush item failed, will retry later"); break; }
             }
@@ -188,9 +233,11 @@ impl Engine {
         Ok(n)
     }
 
-    /// Apply a remote item: decrypt + write to local clipboard (origin-tagged to avoid loops).
+    /// Apply a remote item: decrypt + write to local clipboard (origin-tagged
+    /// to avoid loops) + store in the replica so LAN pollers get it too.
     pub async fn apply_remote(
         &self,
+        db: &Db,
         writer: &dyn crate::clipboard::ClipboardProvider,
         sess: &SessionState,
         item_id: &str,
@@ -209,24 +256,36 @@ impl Engine {
         let pt = crypto::decrypt(&self.key, ciphertext, nonce, item_id, &sess.user_id, source_device, created_at)?;
         writer.write(&pt).await?;
         self.shared.lock().await.last_local_text = Some(pt);
+        // Replica: this node can now serve the item to LAN pollers (phones).
+        // `uploaded=true`: it originated elsewhere, nothing to relay upstream.
+        db.insert(&crate::db::LocalItem {
+            id: item_id.to_string(), ciphertext: ciphertext.to_string(), nonce: nonce.to_string(),
+            created_at: created_at.to_string(), owner_id: sess.user_id.clone(),
+            source_device_id: source_device.to_string(), uploaded: true, pinned: false,
+        })?;
         Ok(())
     }
 
     /// Apply a P2P envelope (WiFi LAN or Bluetooth): same decrypt + write
-    /// path as cloud items. Cross-account envelopes are ignored — LAN has
-    /// no server auth, so the owner_id must match our own user.
+    /// path as cloud items. Foreign-owner envelopes are ignored — without a
+    /// server there is no account auth, so the owner namespace (session user
+    /// or key-derived `local-…`) must match on both sides, i.e. the same
+    /// sync key. Anything decryptable with our key but another owner is
+    /// someone else's clipboard, never ours.
     pub async fn apply_lan_envelope(
         &self,
+        db: &Db,
         writer: &dyn crate::clipboard::ClipboardProvider,
         sess: &SessionState,
         env: &LanEnvelope,
     ) -> anyhow::Result<bool> {
         lan::validate_envelope(env)?;
         if env.item.owner_id != sess.user_id {
-            warn!(sender = %env.sender_device_id, "lan envelope from another account ignored");
+            warn!(sender = %env.sender_device_id, "lan envelope from another key/account ignored");
             return Ok(false);
         }
         self.apply_remote(
+            db,
             writer,
             sess,
             &env.item.id,
@@ -239,15 +298,24 @@ impl Engine {
         Ok(true)
     }
 
-    /// Main loop: clipboard watch + offline flush + cloud WS + LAN + BT status.
+    /// Main loop: clipboard watch + LAN mesh (+ cloud WS/queue when enabled).
     pub async fn run(
         self,
         db: Db,
         reader: Box<dyn crate::clipboard::ClipboardProvider>,
         writer: Box<dyn crate::clipboard::ClipboardProvider>,
     ) -> anyhow::Result<()> {
-        let sess = self.ensure_session(&db).await?;
-        self.flush_queue(&db, &sess).await.unwrap_or(0);
+        // Identity: cloud account when the relay is enabled, otherwise the
+        // key-derived LAN namespace (no server contact at all).
+        let sess = if self.cfg.cloud_enabled {
+            let s = self.ensure_session(&db).await?;
+            let n = self.flush_queue(&db, &s).await.unwrap_or(0);
+            info!(flushed = n, "cloud relay enabled");
+            s
+        } else {
+            info!("cloud relay disabled (UCM_CLOUD_ENABLED=true to enable) — direct LAN/BT mode");
+            local_session(&db, &self.key)?
+        };
 
         // WiFi LAN wiring (registry shared with the broadcast path above).
         let lan_registry: PeerRegistry = match &self.lan_peers {
@@ -267,10 +335,11 @@ impl Engine {
             let lan_port = self.cfg.lan_port;
             let reg = lan_registry.clone();
             let own = sess.device_id.clone();
+            let db_path = format!("{}/history.db", self.cfg.data_dir);
             tokio::spawn(async move { let _ = lan::announce_loop(announce_beacon, discovery_port).await; });
             tokio::spawn(async move { let _ = lan::discover_loop(reg, own, discovery_port).await; });
-            tokio::spawn(async move { let _ = lan::serve(lan_port, lan_tx).await; });
-            info!(port = lan_port, "wifi-lan transport enabled");
+            tokio::spawn(async move { let _ = lan::serve(lan_port, lan_tx, db_path).await; });
+            info!(port = lan_port, "wifi-lan mesh enabled (serve + discover + broadcast)");
         }
         if self.cfg.bt_enabled {
             let st = bluetooth::availability();
@@ -283,7 +352,13 @@ impl Engine {
             async move { reader.watch(tx).await }
         };
         let ws_url = format!("{}/v1/sync?token={}", self.base().replace("http", "ws"), sess.token);
+        let cloud_enabled = self.cfg.cloud_enabled;
         let ws_task = async {
+            if !cloud_enabled {
+                // Never resolve: cloud stays out of the select set entirely.
+                futures_util::future::pending::<()>().await;
+                return;
+            }
             loop {
                 match tokio_tungstenite::connect_async(&ws_url).await {
                     Ok((stream, _)) => {
@@ -295,7 +370,7 @@ impl Engine {
                                     if let Ok(evt) = serde_json::from_str::<serde_json::Value>(m.to_text().unwrap_or_default()) {
                                         if evt["type"] == "item.created" {
                                             let it = &evt["item"];
-                                            let _ = self.apply_remote(&*writer,
+                                            let _ = self.apply_remote(&db, &*writer,
                                                 &sess,
                                                 it["id"].as_str().unwrap_or_default(),
                                                 it["ciphertext"].as_str().unwrap_or_default(),
@@ -318,7 +393,7 @@ impl Engine {
         let lan_task = async {
             loop {
                 if let Some(env) = lan_rx.recv().await {
-                    let _ = self.apply_lan_envelope(&*writer, &sess, &env).await;
+                    let _ = self.apply_lan_envelope(&db, &*writer, &sess, &env).await;
                 }
             }
         };

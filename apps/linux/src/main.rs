@@ -1,6 +1,6 @@
 //! `ucm` CLI: daemon + history/peer controls (tray UI hooks into the same daemon).
 use clap::{Parser, Subcommand};
-use ucm_linux::{bluetooth, clipboard, config::Config, db::Db, keystore, lan, sync::Engine, transport};
+use ucm_linux::{bluetooth, clipboard, config::Config, db::Db, keystore, lan, sync, sync::Engine, transport};
 
 #[derive(Parser)]
 #[command(name = "ucm", version, about = "Universal Clipboard Manager — Linux agent")]
@@ -22,6 +22,13 @@ enum Cmd {
     Resume,
     /// Wipe local keys + history (deliberate reset flow).
     Reset,
+    /// Print the E2E sync key (copy it into the Android app's Settings).
+    KeyShow,
+    /// Adopt a shared E2E key (overwrites this device's key).
+    KeyImport {
+        /// Base64 key from `ucm key-show` on the other device.
+        key: String,
+    },
     /// Show transport policy: WiFi LAN + Bluetooth + cloud switches.
     Transport,
     /// Run only the WiFi LAN listener (prints received envelope ids, never plaintext).
@@ -77,20 +84,26 @@ async fn main() -> anyhow::Result<()> {
             let user = db.get("user_id")?.unwrap_or_default();
             let device = db.get("device_id")?.unwrap_or_default();
             for item in db.recent(limit)? {
-                // created_at is needed for AAD; stored alongside in v1 queue rows via created_at col.
-                match ucm_linux::crypto::decrypt(&key, &item.ciphertext, &item.nonce, &item.id, &user, &device, &item.created_at) {
+                // Per-row AAD identity (falls back to session meta for legacy rows).
+                let owner = if item.owner_id.is_empty() { &user } else { &item.owner_id };
+                let source = if item.source_device_id.is_empty() { &device } else { &item.source_device_id };
+                match ucm_linux::crypto::decrypt(&key, &item.ciphertext, &item.nonce, &item.id, owner, source, &item.created_at) {
                     Ok(t) => println!("{}  {}", item.created_at, t.lines().next().unwrap_or_default()),
-                    Err(_) => println!("{}  <undecryptable — created on another device>", item.created_at),
+                    Err(_) => println!("{}  <undecryptable — created on another device or key>", item.created_at),
                 }
             }
             Ok(())
         }
         Cmd::Pair => {
-            println!("1. Install the Android app and open Pair.");
-            println!("2. On this Linux device, ensure `ucm daemon` has run once (creates your account).");
-            println!("3. In the phone app enter this server URL and confirm the 6-digit code it shows via:");
+            println!("LAN-only (default): no pairing server needed. Share the sync key instead:");
+            println!("  1. On this Linux device: `ucm key-show`");
+            println!("  2. In the Android app: Settings → Sync key → paste → Save.");
+            println!("  3. Fingerprints must match on both sides.");
+            println!();
+            println!("Cloud pairing (only with UCM_CLOUD_ENABLED=true):");
+            println!("  1. Ensure `ucm daemon` has run once (creates your account).");
+            println!("  2. In the phone app enter this server URL and confirm the 6-digit code via:");
             println!("   curl -X POST $UCM_SERVER_URL/v1/pairing/confirm -H \"Authorization: Bearer <token>\" -d '{{\"code\":\"<CODE>\"}}'");
-            println!("4. Verify the device fingerprint shown on both sides before confirming.");
             Ok(())
         }
         Cmd::Pause => {
@@ -114,11 +127,26 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::KeyShow => {
+            let b64 = keystore::show_key_b64(&cfg.data_dir).await?;
+            println!("sync key (keep secret — anyone with this can read your clipboard):");
+            println!("{b64}");
+            println!("fingerprint: {}", keystore::fingerprint_b64(&b64));
+            println!("On the phone: Settings → Sync key → paste → Save. Fingerprints must match.");
+            Ok(())
+        }
+        Cmd::KeyImport { key } => {
+            keystore::import_key_b64(&cfg.data_dir, &key).await?;
+            println!("Key imported. Restart the daemon (systemctl --user restart ucm).");
+            println!("Note: history encrypted with the previous key is no longer readable.");
+            Ok(())
+        }
         Cmd::Transport => {
             let st = bluetooth::availability();
             println!("wifi-lan:   {}", if cfg.wifi_enabled { "enabled" } else { "disabled" });
             println!("bluetooth:  {}", if cfg.bt_enabled { "enabled" } else { "disabled" });
-            println!("cloud:      {}", if cfg.sync_enabled { "enabled" } else { "paused" });
+            println!("cloud:      {} (UCM_CLOUD_ENABLED=true to enable relay)", if cfg.cloud_enabled { "enabled" } else { "disabled — direct LAN/BT mode" });
+            println!("paused:     {}", if cfg.sync_enabled { "no" } else { "yes (UCM_SYNC_ENABLED=false)" });
             println!("lan_port:   {}", cfg.lan_port);
             println!("discovery:  udp/{}", cfg.discovery_port);
             println!("bt_radio:   available={} powered={} ({})", st.available, st.powered, st.detail);
@@ -128,21 +156,34 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::LanServe => {
+            let key = keystore::load_or_create_key(&cfg.data_dir).await?;
             let db = Db::open(&db_path).unwrap_or_else(|_| Db::open_memory().expect("memdb"));
-            let device = db.get("device_id").ok().flatten().unwrap_or_else(|| "unpaired".into());
+            // Real identity (not a placeholder): pushed envelopes must carry
+            // our owner namespace or peers will drop them, and vice versa.
+            let sess = sync::local_session(&db, &key).unwrap_or(sync::SessionState {
+                user_id: sync::lan_owner_id(&key),
+                token: String::new(),
+                device_id: "ephemeral".into(),
+            });
             let (tx, mut rx) = tokio::sync::mpsc::channel::<lan::LanEnvelope>(32);
-            let beacon = lan::local_beacon(&device, &cfg.device_name, cfg.lan_port, cfg.capabilities());
+            let beacon = lan::local_beacon(&sess.device_id, &cfg.device_name, cfg.lan_port, cfg.capabilities());
             let reg = lan::new_registry();
-            let own = device.clone();
+            let own = sess.device_id.clone();
             let dport = cfg.discovery_port;
             let lport = cfg.lan_port;
+            let serve_db = db_path.clone();
             tokio::spawn(async move { let _ = lan::announce_loop(beacon, dport).await; });
             tokio::spawn(async move { let _ = lan::discover_loop(reg, own, dport).await; });
-            tokio::spawn(async move { let _ = lan::serve(lport, tx).await; });
-            println!("LAN serving on tcp/{lport} (device {device}). Ctrl-C to stop.");
+            tokio::spawn(async move { let _ = lan::serve(lport, tx, serve_db).await; });
+            println!("LAN serving on tcp/{lport} (device {}). Ctrl-C to stop.", sess.device_id);
             while let Some(env) = rx.recv().await {
                 // Never print ciphertext or plaintext — id + sender only.
                 println!("lan rx id={} transport={} sender={}", env.item.id, env.transport, env.sender_device_id);
+                // Replica: store anything in our owner namespace for pollers.
+                if env.item.owner_id == sess.user_id {
+                    let db2 = Db::open(&db_path).unwrap_or_else(|_| Db::open_memory().expect("memdb"));
+                    let _ = db2.insert(&lan::to_local_item(&env, true));
+                }
             }
             Ok(())
         }
@@ -167,6 +208,19 @@ async fn main() -> anyhow::Result<()> {
             bt_send_cli(&cfg, &db_path, &text, tcp.as_deref()).await
         }
     }
+}
+
+/// Identity for one-shot CLI sends: the cloud account when the relay holds
+/// one, else the key-derived LAN namespace (works fully offline).
+fn cli_session(db: &Db, cfg: &Config, key: &[u8; 32]) -> anyhow::Result<sync::SessionState> {
+    if cfg.cloud_enabled {
+        if let (Some(user_id), Some(token), Some(device_id)) =
+            (db.get("user_id")?, db.get("token")?, db.get("device_id")?)
+        {
+            return Ok(sync::SessionState { user_id, token, device_id });
+        }
+    }
+    sync::local_session(db, key)
 }
 
 async fn lan_peers_cli(cfg: &Config, timeout_secs: u64) -> anyhow::Result<()> {
@@ -235,18 +289,19 @@ async fn lan_peers_cli(cfg: &Config, timeout_secs: u64) -> anyhow::Result<()> {
 async fn lan_send_cli(cfg: &Config, db_path: &str, host: &str, port: u16, text: &str) -> anyhow::Result<()> {
     let key = keystore::load_or_create_key(&cfg.data_dir).await?;
     let db = Db::open(db_path)?;
-    let user = db.get("user_id")?.unwrap_or_else(|| "lan-local".into());
-    let device = db.get("device_id")?.unwrap_or_else(|| "lan-local-device".into());
+    // Real identity: cloud account when the relay holds one, else the
+    // key-derived LAN namespace — placeholder owners are dropped by peers.
+    let sess = cli_session(&db, cfg, &key)?;
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let (ciphertext, nonce) = ucm_linux::crypto::encrypt(&key, text, &id, &user, &device, &created_at)?;
+    let (ciphertext, nonce) = ucm_linux::crypto::encrypt(&key, text, &id, &sess.user_id, &sess.device_id, &created_at)?;
     let env = lan::LanEnvelope::new_wifi(
-        &device,
+        &sess.device_id,
         &cfg.device_name,
         lan::LanItem {
             id: id.clone(),
-            owner_id: user,
-            source_device_id: device.clone(),
+            owner_id: sess.user_id.clone(),
+            source_device_id: sess.device_id.clone(),
             content_type: "text/plain".into(),
             ciphertext,
             nonce,
@@ -275,20 +330,19 @@ async fn lan_send_cli(cfg: &Config, db_path: &str, host: &str, port: u16, text: 
 async fn bt_send_cli(cfg: &Config, db_path: &str, text: &str, tcp: Option<&str>) -> anyhow::Result<()> {
     let key = keystore::load_or_create_key(&cfg.data_dir).await?;
     let db = Db::open(db_path)?;
-    let user = db.get("user_id")?.unwrap_or_else(|| "bt-local".into());
-    let device = db.get("device_id")?.unwrap_or_else(|| "bt-local-device".into());
+    let sess = cli_session(&db, cfg, &key)?;
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let (ciphertext, nonce) = ucm_linux::crypto::encrypt(&key, text, &id, &user, &device, &created_at)?;
+    let (ciphertext, nonce) = ucm_linux::crypto::encrypt(&key, text, &id, &sess.user_id, &sess.device_id, &created_at)?;
     let env = lan::LanEnvelope {
         v: 1,
         transport: "bluetooth".into(),
-        sender_device_id: device,
+        sender_device_id: sess.device_id.clone(),
         sender_name: Some(cfg.device_name.clone()),
         item: lan::LanItem {
             id: id.clone(),
-            owner_id: user,
-            source_device_id: "bt-local-device".into(),
+            owner_id: sess.user_id.clone(),
+            source_device_id: sess.device_id.clone(),
             content_type: "text/plain".into(),
             ciphertext,
             nonce,

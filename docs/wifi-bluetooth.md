@@ -18,6 +18,15 @@ transport ever sees plaintext.
 
 ## 1. Quickstart
 
+**Step 0 — one shared sync key (required, do this first):**
+Clipboard items are end-to-end encrypted, so every device must hold the
+
+- same 32-byte key — pairing alone does not exchange it (the server never
+  sees keys). On Linux run `ucm key-show`, then in the Android app open
+  **Settings → Sync key**, paste it, and save. The fingerprints must match
+  on both sides. Without this, devices connect fine but every item fails to
+  decrypt (the app tells you how many were skipped).
+
 **Same WiFi (fastest):**
 
 1. On Linux: `ucm daemon` (starts the LAN listener automatically), or `ucm lan-serve` for LAN-only mode.

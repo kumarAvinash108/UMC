@@ -142,3 +142,75 @@ export function buildWifiEnvelope(args: {
     item: args.item,
   };
 }
+
+export interface LanPollCursor {
+  since: string;
+  since_id: string;
+}
+
+/**
+ * Poll a peer's replica (`GET /lan/v1/items`). Returns validated envelopes —
+ * still ciphertext; the caller decrypts with the sync key and skips what it
+ * can't read. Throws with a hint when the peer is unreachable.
+ */
+export async function fetchPeerItems(
+  peer: LanPeer,
+  cursor?: LanPollCursor | null,
+  limit = 100,
+): Promise<{ items: WifiEnvelope[]; cursor: LanPollCursor | null }> {
+  const q =
+    `limit=${limit}` +
+    (cursor ? `&since=${encodeURIComponent(cursor.since)}&since_id=${encodeURIComponent(cursor.since_id)}` : "");
+  let res: Response;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    res = await fetch(`http://${peer.host}:${peer.tcp_port}${LAN_HTTP_PATH}?${q}`, { signal: ctl.signal });
+    clearTimeout(t);
+  } catch (e) {
+    throw new Error(
+      `Cannot reach ${peer.host}:${peer.tcp_port}. Same Wi-Fi? Is \`ucm daemon\`/` +
+        `lan-serve running there? (${e})`,
+    );
+  }
+  if (!res.ok) throw new Error(`LAN poll -> ${res.status}`);
+  const body = (await res.json()) as { items?: unknown[] };
+  const items: WifiEnvelope[] = [];
+  for (const raw of body.items ?? []) {
+    const env = raw as Partial<WifiEnvelope> & { item?: Partial<WifiEnvelopeItem> };
+    const it = env.item ?? {};
+    if (
+      env.v === 1 &&
+      (env.transport === "wifi" || env.transport === "bluetooth") &&
+      typeof env.sender_device_id === "string" &&
+      typeof it.id === "string" &&
+      typeof it.owner_id === "string" &&
+      typeof it.source_device_id === "string" &&
+      typeof it.ciphertext === "string" &&
+      typeof it.nonce === "string" &&
+      typeof it.created_at === "string"
+    ) {
+      items.push({
+        v: 1,
+        transport: env.transport as "wifi" | "bluetooth",
+        sender_device_id: env.sender_device_id,
+        sender_name: typeof env.sender_name === "string" ? env.sender_name : undefined,
+        item: {
+          id: it.id,
+          owner_id: it.owner_id,
+          source_device_id: it.source_device_id,
+          content_type: "text/plain",
+          ciphertext: it.ciphertext,
+          nonce: it.nonce,
+          metadata: typeof it.metadata === "object" && it.metadata !== null ? it.metadata : {},
+          created_at: it.created_at,
+          expires_at: typeof it.expires_at === "string" ? it.expires_at : null,
+          deleted_at: null,
+        },
+      });
+    }
+  }
+  if (items.length === 0) return { items, cursor: cursor ?? null };
+  const last = items[items.length - 1].item;
+  return { items, cursor: { since: last.created_at, since_id: last.id } };
+}

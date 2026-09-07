@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { View, Text, TextInput, Pressable, Alert } from "react-native";
+import { ScrollView, Text, TextInput, Pressable, Alert } from "react-native";
 import { api } from "../lib/api";
 import { loadIdentity, saveIdentity, loadOrCreateKeyB64 } from "../lib/identity";
 
@@ -23,12 +23,18 @@ export default function Pair() {
       await saveIdentity({ user_id: user_id!, token, device_id: d.id });
     }
     setServerOk(true);
-    Alert.alert("Ready", "Device registered. Enter the 6-digit pairing code shown on your other device.");
+    Alert.alert(
+      "Ready",
+      "Device registered. Enter the 6-digit pairing code shown on your other device.",
+    );
   }
 
   async function confirm() {
     const id = await loadIdentity();
-    if (!id.token) { Alert.alert("Error", "Bootstrap first."); return; }
+    if (!id.token) {
+      Alert.alert("Error", "Bootstrap first.");
+      return;
+    }
     try {
       const res = await api.confirmPairing(id.token, code.trim());
       Alert.alert("Paired", `Device trusted. Fingerprint: ${res.fingerprint ?? "n/a"}`);
@@ -38,10 +44,17 @@ export default function Pair() {
   }
 
   return (
-    <View style={{ flex: 1, padding: 16, gap: 12 }}>
+    <ScrollView contentContainerStyle={{ padding: 16, gap: 12 }} keyboardShouldPersistTaps="handled">
       <Text style={{ fontSize: 20, fontWeight: "600" }}>Pair devices</Text>
-      <Text>1. Run the Linux agent once (creates your account). 2. Request a code there. 3. Confirm it here — check the fingerprint matches on both sides.</Text>
-      <Pressable onPress={bootstrap} style={{ padding: 12, backgroundColor: "#111", borderRadius: 8 }}>
+      <Text>
+        1. Run the Linux agent once (creates your account). 2. Request a code there. 3. Confirm it
+        here — check the fingerprint matches on both sides. 4. Then open Settings → Sync key and
+        paste the output of `ucm key-show` (required for decrypt).
+      </Text>
+      <Pressable
+        onPress={bootstrap}
+        style={{ padding: 12, backgroundColor: "#111", borderRadius: 8 }}
+      >
         <Text style={{ color: "#fff", textAlign: "center" }}>Register this phone</Text>
       </Pressable>
       {serverOk && (
@@ -54,11 +67,14 @@ export default function Pair() {
             maxLength={6}
             style={{ borderWidth: 1, borderColor: "#ccc", borderRadius: 8, padding: 10 }}
           />
-          <Pressable onPress={confirm} style={{ padding: 12, backgroundColor: "#0a7", borderRadius: 8 }}>
+          <Pressable
+            onPress={confirm}
+            style={{ padding: 12, backgroundColor: "#0a7", borderRadius: 8 }}
+          >
             <Text style={{ color: "#fff", textAlign: "center" }}>Confirm pairing</Text>
           </Pressable>
         </>
       )}
-    </View>
+    </ScrollView>
   );
 }
