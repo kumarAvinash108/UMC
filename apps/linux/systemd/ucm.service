@@ -1,0 +1,14 @@
+[Unit]
+Description=Universal Clipboard Manager (per-user agent)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/ucm daemon
+Environment=UCM_SERVER_URL=http://localhost:3000
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

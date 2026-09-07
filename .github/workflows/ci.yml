@@ -1,0 +1,20 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci || npm install
+      - run: bash scripts/validate.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: secret scan (gitleaks-style grep)
+        run: |
+          ! grep -RIn --exclude-dir=node_modules --exclude-dir=dist -E 'BEGIN (RSA |OPENSSH )?PRIVATE KEY|AKIA[0-9A-Z]{16}|xox[bap]-' . || (echo 'possible secret found' && exit 1)
+          ! grep -RIn --exclude-dir=node_modules 'console.log.*ciphertext\|plaintext' services/sync/src || true

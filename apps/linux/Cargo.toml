@@ -1,0 +1,37 @@
+[package]
+name = "ucm-linux"
+version = "0.1.0"
+edition = "2021"
+description = "UCM Linux clipboard agent: Wayland/X11 capture, E2E encryption, offline queue, sync"
+
+[[bin]]
+name = "ucm"
+path = "src/main.rs"
+
+[lib]
+name = "ucm_linux"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+secret-service = "4"
+arboard = "3"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ucm
+      POSTGRES_PASSWORD: ucm
+      POSTGRES_DB: ucm
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  sync:
+    build: ./services/sync
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://ucm:ucm@postgres:5432/ucm
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      MAX_ITEM_BYTES: ${MAX_ITEM_BYTES:-65536}
+      MAX_HISTORY_PER_USER: ${MAX_HISTORY_PER_USER:-1000}
+      DEFAULT_EXPIRY_DAYS: ${DEFAULT_EXPIRY_DAYS:-7}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:

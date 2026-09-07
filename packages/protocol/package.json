@@ -1,0 +1,13 @@
+{
+  "name": "@ucm/protocol",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test dist/test/*.test.js",
+    "pretest": "npm run build",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}
