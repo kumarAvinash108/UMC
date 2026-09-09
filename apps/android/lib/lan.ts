@@ -45,7 +45,7 @@ export interface WifiEnvelopeItem {
 
 export interface WifiEnvelope {
   v: 1;
-  transport: "wifi";
+  transport: "wifi" | "bluetooth";
   sender_device_id: string;
   sender_name?: string;
   item: WifiEnvelopeItem;
@@ -177,8 +177,10 @@ export async function fetchPeerItems(
   const body = (await res.json()) as { items?: unknown[] };
   const items: WifiEnvelope[] = [];
   for (const raw of body.items ?? []) {
-    const env = raw as Partial<WifiEnvelope> & { item?: Partial<WifiEnvelopeItem> };
-    const it = env.item ?? {};
+    const env = raw as Partial<WifiEnvelope> & {
+      item?: Partial<WifiEnvelopeItem>;
+    };
+    const it: Partial<WifiEnvelopeItem> = env.item ?? {};
     if (
       env.v === 1 &&
       (env.transport === "wifi" || env.transport === "bluetooth") &&

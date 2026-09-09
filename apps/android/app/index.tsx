@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { View, Text, TextInput, FlatList, Pressable, RefreshControl, Alert } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as SecureStore from "expo-secure-store";
@@ -74,10 +74,15 @@ async function importCiphertext(syncKey: string, it: ServerItem): Promise<number
   }
 }
 
+async function writeIncomingClipboard(text: string, source: string, localDeviceId: string) {
+  if (source === localDeviceId) return;
+  await Clipboard.setStringAsync(text);
+}
+
 /**
  * History screen: foreground pull/push + sync-status indicator + copy action.
- * Background clipboard monitoring is intentionally NOT promised (Android OS limits):
- * tap "Push clipboard" to share what you just copied, pull to refresh for the rest.
+ * Android only permits reliable clipboard access while the app is foregrounded,
+ * so the foreground loop polls and syncs new clipboard text automatically.
  */
 export default function History() {
   const [q, setQ] = useState("");
@@ -88,6 +93,11 @@ export default function History() {
   const [hasKey, setHasKey] = useState<boolean | null>(null);
   const [unreadable, setUnreadable] = useState(0);
   const router = useRouter();
+  const startedAt = useRef(Date.now());
+  const lastPushedText = useRef<string | null>(null);
+  const ignoredClipboardText = useRef<string | null>(null);
+  const appliedIncomingIds = useRef<Set<string>>(new Set());
+  const pushingRef = useRef(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -100,6 +110,9 @@ export default function History() {
       setHasKey(keyOk);
       let failed = 0;
       if (keyOk) {
+        const localDeviceId = policy.cloudEnabled && id.device_id
+          ? id.device_id
+          : await getOrCreateLocalDeviceId();
         // New/changed sync key => full LAN re-pull so previously skipped
         // items get another chance instead of staying behind the cursor.
         const fp = keyFingerprint(syncKey!);
@@ -115,6 +128,15 @@ export default function History() {
           for (const it of page.items ?? []) {
             if (it.deleted_at) continue;
             failed += await importCiphertext(syncKey!, it);
+            if (!appliedIncomingIds.current.has(it.id) && Date.parse(it.created_at) >= startedAt.current && it.source_device_id !== localDeviceId) {
+              const text = decryptText({
+                keyB64: syncKey!, ciphertextB64: it.ciphertext, nonceB64: it.nonce,
+                aad: { id: it.id, owner_id: it.owner_id, source_device_id: it.source_device_id, content_type: "text/plain", created_at: it.created_at },
+              });
+              ignoredClipboardText.current = text;
+              await writeIncomingClipboard(text, it.source_device_id, localDeviceId);
+              appliedIncomingIds.current.add(it.id);
+            }
           }
         }
         // Direct LAN poll (no cloud): every known peer serves its replica.
@@ -139,6 +161,15 @@ export default function History() {
                     expires_at: env.item.expires_at,
                     deleted_at: null,
                   });
+                  if (!appliedIncomingIds.current.has(env.item.id) && Date.parse(env.item.created_at) >= startedAt.current && env.item.source_device_id !== localDeviceId) {
+                    const text = decryptText({
+                      keyB64: syncKey!, ciphertextB64: env.item.ciphertext, nonceB64: env.item.nonce,
+                      aad: { id: env.item.id, owner_id: env.item.owner_id, source_device_id: env.item.source_device_id, content_type: "text/plain", created_at: env.item.created_at },
+                    });
+                    ignoredClipboardText.current = text;
+                    await writeIncomingClipboard(text, env.item.source_device_id, localDeviceId);
+                    appliedIncomingIds.current.add(env.item.id);
+                  }
                 }
                 cursor = r.cursor;
                 if (r.items.length < 100) break;
@@ -162,6 +193,17 @@ export default function History() {
 
   useEffect(() => {
     refresh();
+    const poll = setInterval(async () => {
+      if (pushingRef.current) return;
+      const text = (await Clipboard.getStringAsync()).trim();
+      if (!text || text === lastPushedText.current) return;
+      if (text === ignoredClipboardText.current) {
+        ignoredClipboardText.current = null;
+        return;
+      }
+      await pushClipboard(true);
+    }, 1000);
+    const refreshTimer = setInterval(refresh, 3000);
     let ws: WebSocket | null = null;
     (async () => {
       const id = await loadIdentity();
@@ -176,7 +218,11 @@ export default function History() {
         } catch {}
       };
     })();
-    return () => ws?.close();
+    return () => {
+      clearInterval(poll);
+      clearInterval(refreshTimer);
+      ws?.close();
+    };
   }, [refresh]);
 
   async function copyRow(row: LocalRow) {
@@ -185,7 +231,9 @@ export default function History() {
   }
 
   /** Read the Android clipboard, encrypt, and fan out (wifi → bluetooth → cloud-if-enabled). */
-  async function pushClipboard() {
+  async function pushClipboard(silent = false) {
+    if (pushingRef.current) return;
+    pushingRef.current = true;
     setPushing(true);
     try {
       const id = await loadIdentity();
@@ -202,9 +250,10 @@ export default function History() {
       const source = cloudMode ? id.device_id! : await getOrCreateLocalDeviceId();
       const text = (await Clipboard.getStringAsync()).trim();
       if (!text) {
-        Alert.alert("Clipboard empty", "Copy some text first, then push.");
+        if (!silent) Alert.alert("Clipboard empty", "Copy some text first, then push.");
         return;
       }
+      if (text === lastPushedText.current) return;
       if (text.length > 60_000) {
         Alert.alert("Too large", "v1 text items are capped (~60 KiB).");
         return;
@@ -246,19 +295,23 @@ export default function History() {
         pinned: 0,
         pending: policy.cloudEnabled && !r.cloud ? 1 : 0,
       });
+      lastPushedText.current = text;
       const via = [
         `wifi:${r.wifi}`,
         `bt:${r.bluetooth}`,
         `cloud:${r.cloud ? "ok" : policy.cloudEnabled ? "queued" : "off"}`,
       ].join(" ");
-      Alert.alert(
-        "Pushed",
-        r.errors.length ? `Sent (${via}). Notes: ${r.errors.join("; ")}` : `Sent (${via}).`,
-      );
+      if (!silent) {
+        Alert.alert(
+          "Pushed",
+          r.errors.length ? `Sent (${via}). Notes: ${r.errors.join("; ")}` : `Sent (${via}).`,
+        );
+      }
       await refresh();
     } catch (e) {
-      Alert.alert("Push failed", String(e));
+      if (!silent) Alert.alert("Push failed", String(e));
     } finally {
+      pushingRef.current = false;
       setPushing(false);
     }
   }
@@ -304,7 +357,7 @@ export default function History() {
         </Pressable>
       )}
       <Pressable
-        onPress={pushClipboard}
+        onPress={() => void pushClipboard()}
         disabled={pushing}
         style={{ padding: 14, backgroundColor: pushing ? "#666" : "#0a7", borderRadius: 8 }}
       >
@@ -341,7 +394,7 @@ export default function History() {
                 <Text>{unreadable} item(s) can't be decrypted — sync-key mismatch? Tap to re-enter the key.</Text>
               </Pressable>
             )}
-            <Pressable onPress={pushClipboard} disabled={pushing} style={{ padding: 14, backgroundColor: pushing ? "#666" : "#0a7", borderRadius: 8 }}>
+            <Pressable onPress={() => void pushClipboard()} disabled={pushing} style={{ padding: 14, backgroundColor: pushing ? "#666" : "#0a7", borderRadius: 8 }}>
               <Text style={{ color: "#fff", textAlign: "center", fontWeight: "600" }}>{pushing ? "Pushing…" : "Push current clipboard"}</Text>
             </Pressable>
             <TextInput placeholder="Search history…" value={q} onChangeText={(t) => setQ(t)} onSubmitEditing={refresh} style={{ borderWidth: 1, borderColor: "#ccc", borderRadius: 8, padding: 10 }} />
