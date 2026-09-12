@@ -3,8 +3,16 @@
     "name": "UCM Clipboard",
     "slug": "ucm-clipboard",
     "scheme": "ucm",
-    "android": { "package": "com.ucm.clipboard" },
-    "plugins": ["expo-router", "expo-secure-store"],
-    "extra": { "syncUrl": "http://localhost:3000" }
+    "android": {
+      "package": "com.ucm.clipboard"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-sqlite"
+    ],
+    "extra": {
+      "syncUrl": "http://localhost:3000"
+    }
   }
 }

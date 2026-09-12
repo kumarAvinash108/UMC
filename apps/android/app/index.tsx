@@ -43,10 +43,12 @@ interface ServerItem {
 
 /**
  * Decrypt one ciphertext item and import it to local history.
- * Returns 1 when the item was skipped (wrong key / tampered) — the raw
- * bytes are never displayed or logged.
+ * Returns the plaintext on success, or null when the item was skipped
+ * (wrong key / tampered) — the raw bytes are never displayed or logged.
+ * The caller reuses the returned plaintext instead of decrypting twice,
+ * so one bad item never aborts the whole refresh.
  */
-async function importCiphertext(syncKey: string, it: ServerItem): Promise<number> {
+async function importCiphertext(syncKey: string, it: ServerItem): Promise<string | null> {
   try {
     const pt = decryptText({
       keyB64: syncKey,
@@ -68,9 +70,9 @@ async function importCiphertext(syncKey: string, it: ServerItem): Promise<number
       pinned: 0,
       pending: 0,
     });
-    return 0;
+    return pt;
   } catch {
-    return 1;
+    return null;
   }
 }
 
@@ -127,12 +129,12 @@ export default function History() {
           const page = (await api.listItems(id.token, undefined, 50)) as { items: ServerItem[] };
           for (const it of page.items ?? []) {
             if (it.deleted_at) continue;
-            failed += await importCiphertext(syncKey!, it);
+            const text = await importCiphertext(syncKey!, it);
+            if (text === null) {
+              failed += 1;
+              continue;
+            }
             if (!appliedIncomingIds.current.has(it.id) && Date.parse(it.created_at) >= startedAt.current && it.source_device_id !== localDeviceId) {
-              const text = decryptText({
-                keyB64: syncKey!, ciphertextB64: it.ciphertext, nonceB64: it.nonce,
-                aad: { id: it.id, owner_id: it.owner_id, source_device_id: it.source_device_id, content_type: "text/plain", created_at: it.created_at },
-              });
               ignoredClipboardText.current = text;
               await writeIncomingClipboard(text, it.source_device_id, localDeviceId);
               appliedIncomingIds.current.add(it.id);
@@ -149,7 +151,7 @@ export default function History() {
               for (let p = 0; p < 5; p++) {
                 const r = await fetchPeerItems(peer, cursor, 100);
                 for (const env of r.items) {
-                  failed += await importCiphertext(syncKey!, {
+                  const text = await importCiphertext(syncKey!, {
                     id: env.item.id,
                     owner_id: env.item.owner_id,
                     source_device_id: env.item.source_device_id,
@@ -161,11 +163,11 @@ export default function History() {
                     expires_at: env.item.expires_at,
                     deleted_at: null,
                   });
+                  if (text === null) {
+                    failed += 1;
+                    continue;
+                  }
                   if (!appliedIncomingIds.current.has(env.item.id) && Date.parse(env.item.created_at) >= startedAt.current && env.item.source_device_id !== localDeviceId) {
-                    const text = decryptText({
-                      keyB64: syncKey!, ciphertextB64: env.item.ciphertext, nonceB64: env.item.nonce,
-                      aad: { id: env.item.id, owner_id: env.item.owner_id, source_device_id: env.item.source_device_id, content_type: "text/plain", created_at: env.item.created_at },
-                    });
                     ignoredClipboardText.current = text;
                     await writeIncomingClipboard(text, env.item.source_device_id, localDeviceId);
                     appliedIncomingIds.current.add(env.item.id);
@@ -376,30 +378,6 @@ export default function History() {
         data={rows}
         keyExtractor={(r) => r.id}
         contentContainerStyle={{ paddingBottom: 24 }}
-        ListHeaderComponent={
-          <View style={{ gap: 12, paddingBottom: 12 }}>
-            <Text style={{ fontSize: 20, fontWeight: "600" }}>Clipboard history ({status})</Text>
-            <Text style={{ color: "#666" }}>
-              Android cannot monitor the clipboard in the background. Copy text, tap Push, then pull to
-              refresh for items from your other devices. WiFi peers: {listLanPeers().length} — add your
-              PC's LAN IP in Settings for direct sync.
-            </Text>
-            {hasKey === false && (
-              <Pressable onPress={() => router.push("/settings")} style={{ padding: 12, backgroundColor: "#fff4e0", borderRadius: 8, borderWidth: 1, borderColor: "#e0a800" }}>
-                <Text>Sync key missing — nothing can decrypt. Tap to paste the key from `ucm key-show`.</Text>
-              </Pressable>
-            )}
-            {unreadable > 0 && (
-              <Pressable onPress={() => router.push("/settings")} style={{ padding: 12, backgroundColor: "#fdecea", borderRadius: 8, borderWidth: 1, borderColor: "#c00" }}>
-                <Text>{unreadable} item(s) can't be decrypted — sync-key mismatch? Tap to re-enter the key.</Text>
-              </Pressable>
-            )}
-            <Pressable onPress={() => void pushClipboard()} disabled={pushing} style={{ padding: 14, backgroundColor: pushing ? "#666" : "#0a7", borderRadius: 8 }}>
-              <Text style={{ color: "#fff", textAlign: "center", fontWeight: "600" }}>{pushing ? "Pushing…" : "Push current clipboard"}</Text>
-            </Pressable>
-            <TextInput placeholder="Search history…" value={q} onChangeText={(t) => setQ(t)} onSubmitEditing={refresh} style={{ borderWidth: 1, borderColor: "#ccc", borderRadius: 8, padding: 10 }} />
-          </View>
-        }
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
         ListEmptyComponent={<Text>No items yet. Copy text on Linux, then pull to refresh.</Text>}
         renderItem={({ item }) => (

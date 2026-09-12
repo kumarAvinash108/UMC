@@ -17,7 +17,8 @@ export function createApp() {
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));
-  app.use(cors({ origin: (process.env.CORS_ORIGINS ?? "").split(",").filter(Boolean) || true }));
+  const corsOrigins = (process.env.CORS_ORIGINS ?? "").split(",").filter(Boolean);
+  app.use(cors({ origin: corsOrigins.length ? corsOrigins : true }));
   // Never log request bodies (they contain ciphertext); log only method/path/status.
   app.use((req, res, next) => {
     const t = Date.now();

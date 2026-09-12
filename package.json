@@ -14,6 +14,10 @@
     "protocol:test": "npm run test --workspace=@ucm/protocol",
     "sync:test": "npm run test --workspace=@ucm/sync-service",
     "sync:dev": "npm run dev --workspace=@ucm/sync-service",
+    "dev": "bash ./scripts/start-dev.sh",
+    "dev:sync": "bash ./scripts/start-dev.sh --sync-only",
+    "dev:android": "bash ./scripts/start-dev.sh --android-only",
+    "dev:linux": "bash ./scripts/start-dev.sh --linux-only",
     "lint": "npx prettier --check . && npx tsc --noEmit -p tsconfig.base.json || true"
   },
   "devDependencies": {
@@ -24,7 +28,7 @@
     "node": ">=20"
   },
   "overrides": {
-    "react": "19.1.0",
-    "react-native": "0.81.5"
+    "react": "19.2.3",
+    "react-native": "0.86.3"
   }
 }
