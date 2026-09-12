@@ -3,10 +3,9 @@ import { View, Text, TextInput, FlatList, Pressable, RefreshControl, Alert } fro
 import * as Clipboard from "expo-clipboard";
 import * as SecureStore from "expo-secure-store";
 import { Link, useRouter } from "expo-router";
-import { api, wsUrl } from "../lib/api";
-import { loadIdentity, getSyncKeyB64, getOrCreateLocalDeviceId } from "../lib/identity";
+import { getSyncKeyB64, setSyncKeyB64, getOrCreateLocalDeviceId } from "../lib/identity";
 import { listLanPeers, fetchPeerItems, type LanPollCursor } from "../lib/lan";
-import { decryptText, encryptText, isValidKeyB64, keyFingerprint, lanOwnerId, randomId } from "../lib/crypto";
+import { decryptText, encryptText, generateSyncKeyB64, isValidKeyB64, keyFingerprint, lanOwnerId, randomId } from "../lib/crypto";
 import { fanOut, loadPolicy } from "../lib/transport";
 import { searchRows, upsertRow, setPinned, deleteRow, type LocalRow } from "../lib/store";
 
@@ -105,16 +104,15 @@ export default function History() {
     setRefreshing(true);
     setStatus("syncing");
     try {
-      const id = await loadIdentity();
       const policy = await loadPolicy();
       const syncKey = await getSyncKeyB64();
       const keyOk = isValidKeyB64(syncKey);
       setHasKey(keyOk);
       let failed = 0;
       if (keyOk) {
-        const localDeviceId = policy.cloudEnabled && id.device_id
-          ? id.device_id
-          : await getOrCreateLocalDeviceId();
+        // WiFi/Bluetooth only: identity is the key-derived LAN namespace
+        // (must match Linux `lan_owner_id`) — no accounts, no registration.
+        const localDeviceId = await getOrCreateLocalDeviceId();
         // New/changed sync key => full LAN re-pull so previously skipped
         // items get another chance instead of staying behind the cursor.
         const fp = keyFingerprint(syncKey!);
@@ -124,24 +122,7 @@ export default function History() {
           await SecureStore.deleteItemAsync(CURSOR_K.since);
           await SecureStore.deleteItemAsync(CURSOR_K.sinceId);
         }
-        // Cloud pull (opt-in relay for off-LAN devices).
-        if (policy.cloudEnabled && id.token) {
-          const page = (await api.listItems(id.token, undefined, 50)) as { items: ServerItem[] };
-          for (const it of page.items ?? []) {
-            if (it.deleted_at) continue;
-            const text = await importCiphertext(syncKey!, it);
-            if (text === null) {
-              failed += 1;
-              continue;
-            }
-            if (!appliedIncomingIds.current.has(it.id) && Date.parse(it.created_at) >= startedAt.current && it.source_device_id !== localDeviceId) {
-              ignoredClipboardText.current = text;
-              await writeIncomingClipboard(text, it.source_device_id, localDeviceId);
-              appliedIncomingIds.current.add(it.id);
-            }
-          }
-        }
-        // Direct LAN poll (no cloud): every known peer serves its replica.
+        // Direct LAN poll: every known peer serves its replica.
         // Cursor is shared across peers — replicas overlap, and the max
         // cursor always moves forward.
         if (policy.wifiEnabled) {
@@ -206,24 +187,9 @@ export default function History() {
       await pushClipboard(true);
     }, 1000);
     const refreshTimer = setInterval(refresh, 3000);
-    let ws: WebSocket | null = null;
-    (async () => {
-      const id = await loadIdentity();
-      const policy = await loadPolicy();
-      // WS live updates only exist on the opt-in cloud relay.
-      if (!policy.cloudEnabled || !id.token) return;
-      ws = new WebSocket(wsUrl(id.token));
-      ws.onmessage = async (m) => {
-        try {
-          const evt = JSON.parse(m.data);
-          if (evt.type === "item.created" || evt.type === "item.deleted") await refresh();
-        } catch {}
-      };
-    })();
     return () => {
       clearInterval(poll);
       clearInterval(refreshTimer);
-      ws?.close();
     };
   }, [refresh]);
 
@@ -232,24 +198,21 @@ export default function History() {
     Alert.alert("Copied", "Item copied to Android clipboard.");
   }
 
-  /** Read the Android clipboard, encrypt, and fan out (wifi → bluetooth → cloud-if-enabled). */
+  /** Read the Android clipboard, encrypt, and fan out (wifi → bluetooth). */
   async function pushClipboard(silent = false) {
     if (pushingRef.current) return;
     pushingRef.current = true;
     setPushing(true);
     try {
-      const id = await loadIdentity();
       const policy = await loadPolicy();
       const syncKey = await getSyncKeyB64();
-      if (!isValidKeyB64(syncKey)) {
-        Alert.alert("Sync key missing", "Paste the key from `ucm key-show` in Settings first.");
-        return;
-      }
-      // Identity: cloud account when the relay is on and paired, otherwise
-      // the key-derived LAN namespace (must match Linux `lan_owner_id`).
-      const cloudMode = policy.cloudEnabled && !!id.token && !!id.user_id && !!id.device_id;
-      const owner = cloudMode ? id.user_id! : lanOwnerId(syncKey!);
-      const source = cloudMode ? id.device_id! : await getOrCreateLocalDeviceId();
+      // Unreachable in the UI (first-run onboarding gates on a valid key),
+      // but never push unencrypted rather than nagging.
+      if (!isValidKeyB64(syncKey)) return;
+      // Identity is the key-derived LAN namespace (must match Linux
+      // `lan_owner_id`) — no accounts, no registration.
+      const owner = lanOwnerId(syncKey!);
+      const source = await getOrCreateLocalDeviceId();
       const text = (await Clipboard.getStringAsync()).trim();
       if (!text) {
         if (!silent) Alert.alert("Clipboard empty", "Copy some text first, then push.");
@@ -274,7 +237,6 @@ export default function History() {
         },
       });
       const r = await fanOut(
-        cloudMode ? id.token : null,
         {
           id: itemId,
           content_type: "text/plain",
@@ -295,14 +257,10 @@ export default function History() {
         source_device: source,
         created_at,
         pinned: 0,
-        pending: policy.cloudEnabled && !r.cloud ? 1 : 0,
+        pending: 0,
       });
       lastPushedText.current = text;
-      const via = [
-        `wifi:${r.wifi}`,
-        `bt:${r.bluetooth}`,
-        `cloud:${r.cloud ? "ok" : policy.cloudEnabled ? "queued" : "off"}`,
-      ].join(" ");
+      const via = [`wifi:${r.wifi}`, `bt:${r.bluetooth}`].join(" ");
       if (!silent) {
         Alert.alert(
           "Pushed",
@@ -318,6 +276,12 @@ export default function History() {
     }
   }
 
+  // First run (or after Reset): no nagging banner — a dedicated setup
+  // screen that explains the two ways to get a sync key.
+  if (hasKey === false) {
+    return <KeyOnboarding onDone={refresh} />;
+  }
+
   return (
     <View style={{ flex: 1, padding: 16, gap: 12 }}>
       <Text style={{ fontSize: 20, fontWeight: "600" }}>Clipboard history ({status})</Text>
@@ -326,22 +290,6 @@ export default function History() {
         refresh for items from your other devices.
         {` `}WiFi peers: {listLanPeers().length} — add your PC's LAN IP in Settings for direct sync.
       </Text>
-      {hasKey === false && (
-        <Pressable
-          onPress={() => router.push("/settings")}
-          style={{
-            padding: 12,
-            backgroundColor: "#fff4e0",
-            borderRadius: 8,
-            borderWidth: 1,
-            borderColor: "#e0a800",
-          }}
-        >
-          <Text>
-            Sync key missing — nothing can decrypt. Tap to paste the key from `ucm key-show`.
-          </Text>
-        </Pressable>
-      )}
       {unreadable > 0 && (
         <Pressable
           onPress={() => router.push("/settings")}
@@ -412,12 +360,6 @@ export default function History() {
               </Pressable>
               <Pressable
                 onPress={async () => {
-                  const id = await loadIdentity();
-                  if (id.token) {
-                    try {
-                      await api.deleteItem(id.token, item.id);
-                    } catch {}
-                  }
                   await deleteRow(item.id);
                   await refresh();
                 }}
@@ -431,8 +373,6 @@ export default function History() {
         ListFooterComponent={
           <View style={{ gap: 12, paddingTop: 4 }}>
             <View style={{ flexDirection: "row", gap: 12 }}>
-              <Link href="/pair">Pair a device</Link>
-              <Link href="/devices">Devices</Link>
               <Link href="/settings">Settings</Link>
             </View>
             {__DEV__ && <SyncSelfTest onSeed={async (t) => {
@@ -442,6 +382,128 @@ export default function History() {
           </View>
         }
       />
+    </View>
+  );
+}
+
+/**
+ * First-run setup: no "sync key missing" error — the user either pastes the
+ * key from Linux (`ucm key-show`) or generates a fresh one here and imports
+ * it on Linux (`ucm key-import <key>`). Either way both sides end up with
+ * the same E2E key and the history screen takes over.
+ */
+function KeyOnboarding({ onDone }: { onDone: () => Promise<void> }) {
+  const [draft, setDraft] = useState("");
+  const [fresh, setFresh] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function savePasted() {
+    const v = draft.trim();
+    if (!isValidKeyB64(v)) {
+      Alert.alert(
+        "That doesn't look like a sync key",
+        "Paste the exact output of `ucm key-show` on your Linux device (base64, 44 characters).",
+      );
+      return;
+    }
+    setSaving(true);
+    try {
+      await setSyncKeyB64(v);
+    } catch (e) {
+      Alert.alert("Save failed", `Could not write secure storage: ${String(e)}`);
+      return;
+    } finally {
+      setSaving(false);
+    }
+    setDraft("");
+    await onDone();
+  }
+
+  async function generate() {
+    setSaving(true);
+    try {
+      const k = generateSyncKeyB64();
+      await setSyncKeyB64(k);
+      setFresh(k);
+    } catch (e) {
+      Alert.alert("Save failed", `Could not write secure storage: ${String(e)}`);
+      return;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function copyFresh() {
+    if (fresh) await Clipboard.setStringAsync(fresh);
+  }
+
+  return (
+    <View style={{ flex: 1, padding: 20, gap: 14, justifyContent: "center" }}>
+      <Text style={{ fontSize: 22, fontWeight: "700" }}>Welcome to UCM 🎉</Text>
+      <Text style={{ color: "#444" }}>
+        Everything is end-to-end encrypted over direct WiFi / Bluetooth — no account, no
+        registration. First, both devices need the same sync key. Pick one:
+      </Text>
+
+      <Text style={{ fontSize: 16, fontWeight: "600" }}>Option 1 — paste your Linux key</Text>
+      <Text style={{ color: "#666" }}>
+        On your PC run `ucm key-show`, then paste the key here.
+      </Text>
+      <TextInput
+        placeholder="Paste sync key (base64, 44 chars)"
+        value={draft}
+        onChangeText={setDraft}
+        autoCapitalize="none"
+        autoCorrect={false}
+        style={{ borderWidth: 1, borderColor: "#ccc", borderRadius: 8, padding: 10 }}
+      />
+      <Pressable
+        onPress={() => void savePasted()}
+        disabled={saving}
+        style={{ padding: 14, backgroundColor: saving ? "#666" : "#0a7", borderRadius: 8 }}
+      >
+        <Text style={{ color: "#fff", textAlign: "center", fontWeight: "600" }}>
+          {saving ? "Saving…" : "Save pasted key"}
+        </Text>
+      </Pressable>
+
+      <Text style={{ fontSize: 16, fontWeight: "600" }}>Option 2 — make one here</Text>
+      <Text style={{ color: "#666" }}>
+        No Linux key yet? Generate one, then on your PC run `ucm key-import` with it.
+      </Text>
+      <Pressable
+        onPress={() => void generate()}
+        disabled={saving}
+        style={{ padding: 14, backgroundColor: saving ? "#666" : "#111", borderRadius: 8 }}
+      >
+        <Text style={{ color: "#fff", textAlign: "center", fontWeight: "600" }}>
+          {saving ? "Saving…" : "Generate a new key"}
+        </Text>
+      </Pressable>
+      {fresh && (
+        <View style={{ padding: 12, borderWidth: 1, borderColor: "#0a7", borderRadius: 8, gap: 8 }}>
+          <Text selectable style={{ fontFamily: "monospace" }}>
+            {fresh}
+          </Text>
+          <Text style={{ color: "#666", fontSize: 12 }}>
+            Fingerprint: {keyFingerprint(fresh)} — compare after `ucm key-import` on Linux.
+          </Text>
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            <Pressable
+              onPress={() => void copyFresh()}
+              style={{ padding: 8, backgroundColor: "#111", borderRadius: 6 }}
+            >
+              <Text style={{ color: "#fff" }}>Copy key</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => void onDone()}
+              style={{ padding: 8, borderWidth: 1, borderRadius: 6 }}
+            >
+              <Text>Done — show history</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
     </View>
   );
 }

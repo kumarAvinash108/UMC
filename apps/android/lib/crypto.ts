@@ -33,16 +33,68 @@ export function buildAADBytes(aad: ItemAAD): Uint8Array {
   return utf8ToBytes(JSON.stringify(ordered));
 }
 
+const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_REV: Record<string, number> = {};
+for (let i = 0; i < B64_ALPHABET.length; i++) B64_REV[B64_ALPHABET[i]] = i;
+
+/**
+ * STANDARD base64 encode. Hand-rolled (no global `btoa`): Hermes' `btoa` is
+ * unreliable on some Android builds, and every real sync key needs correct
+ * `=` padding. Output matches Rust `STANDARD.encode` and Node
+ * `Buffer.toString("base64")` byte-for-byte.
+ */
 export function bytesToBase64(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i];
+    const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    const n = (a << 16) | (b << 8) | c;
+    out += B64_ALPHABET[(n >> 18) & 63] + B64_ALPHABET[(n >> 12) & 63];
+    out += i + 1 < bytes.length ? B64_ALPHABET[(n >> 6) & 63] : "=";
+    out += i + 2 < bytes.length ? B64_ALPHABET[n & 63] : "=";
+  }
+  return out;
 }
 
+/**
+ * STANDARD base64 decode. Hand-rolled (no global `atob`): Hermes' `atob`
+ * throws on `=` padding on some Android builds, which made EVERY valid
+ * 32-byte sync key (always `...=`-padded) fail validation and produced the
+ * endless "Sync key missing" popup. Whitespace is stripped so keys pasted
+ * with terminal line-wraps still decode; anything else strict so keys stay
+ * byte-compatible with `ucm key-show` / `ucm key-import` on Linux.
+ */
 export function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64.trim());
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  const clean = b64.replace(/\s+/g, "");
+  if (clean.length === 0) return new Uint8Array(0);
+  if (clean.length % 4 !== 0) throw new Error("invalid base64 length");
+  let pad = 0;
+  if (clean.endsWith("==")) pad = 2;
+  else if (clean.endsWith("=")) pad = 1;
+  const body = pad > 0 ? clean.slice(0, -pad) : clean;
+  if (!/^[A-Za-z0-9+/]+$/.test(body)) throw new Error("invalid base64 characters");
+  const out = new Uint8Array((clean.length / 4) * 3 - pad);
+  let o = 0;
+  for (let i = 0; i < clean.length; i += 4) {
+    const quad = [clean[i], clean[i + 1], clean[i + 2], clean[i + 3]];
+    const vals = quad.map((ch, j) => {
+      if (ch === "=") {
+        // Padding is only legal in the last quad, last 1-2 slots.
+        if (i + 4 !== clean.length || j < 2 + (pad === 1 ? 1 : 0)) {
+          throw new Error("misplaced base64 padding");
+        }
+        return 0;
+      }
+      const v = B64_REV[ch];
+      if (v === undefined) throw new Error("invalid base64 characters");
+      return v;
+    });
+    const n = (vals[0] << 18) | (vals[1] << 12) | (vals[2] << 6) | vals[3];
+    out[o++] = (n >> 16) & 255;
+    if (quad[2] !== "=") out[o++] = (n >> 8) & 255;
+    if (quad[3] !== "=") out[o++] = n & 255;
+  }
   return out;
 }
 
@@ -81,6 +133,15 @@ function randomBytes(n: number): Uint8Array {
   const b = new Uint8Array(n);
   crypto.getRandomValues(b);
   return b;
+}
+
+/**
+ * Mint a fresh 32-byte E2E sync key (STANDARD base64, 44 chars).
+ * Use for first-run onboarding when the user has no Linux key yet —
+ * they then run `ucm key-import <key>` on Linux so both sides match.
+ */
+export function generateSyncKeyB64(): string {
+  return bytesToBase64(randomBytes(32));
 }
 
 /** Random UUIDv4 for client-generated item ids (conflict-safe). */

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { ScrollView, View, Text, TextInput, Pressable, Alert } from "react-native";
 import * as SecureStore from "expo-secure-store";
-import { resetAll, getSyncKeyB64, setSyncKeyB64 } from "../lib/identity";
+import { resetAll, getSyncKeyB64, setSyncKeyB64, getOrCreateLocalDeviceId } from "../lib/identity";
 import { isValidKeyB64, keyFingerprint } from "../lib/crypto";
 import {
   addManualPeer,
@@ -15,20 +15,17 @@ import {
 } from "../lib/lan";
 import { getBtStatus, btOutbox } from "../lib/bluetooth";
 import { getTransportStatus, type TransportPolicy } from "../lib/transport";
-import { loadIdentity } from "../lib/identity";
 
-const K = { wifi: "ucm.wifi", bt: "ucm.bt", cloud: "ucm.cloud" };
+const K = { wifi: "ucm.wifi", bt: "ucm.bt" };
 
 async function loadPolicy(): Promise<TransportPolicy> {
-  const [w, b, c] = await Promise.all([
+  const [w, b] = await Promise.all([
     SecureStore.getItemAsync(K.wifi),
     SecureStore.getItemAsync(K.bt),
-    SecureStore.getItemAsync(K.cloud),
   ]);
   return {
     wifiEnabled: w !== "0",
     bluetoothEnabled: b !== "0",
-    cloudEnabled: c !== "0",
   };
 }
 
@@ -37,7 +34,6 @@ export default function Settings() {
   const [policy, setPolicy] = useState<TransportPolicy>({
     wifiEnabled: true,
     bluetoothEnabled: true,
-    cloudEnabled: true,
   });
   const [peers, setPeers] = useState<LanPeer[]>([]);
   const [host, setHost] = useState("");
@@ -78,13 +74,16 @@ export default function Settings() {
       <Text>Auto-delete default: 7 days. History limit: 1000 items. Max item: 64 KiB.</Text>
 
       <Text style={{ fontSize: 16, fontWeight: "600", marginTop: 8 }}>
-        Transports (wifi → bluetooth → cloud)
+        Transports (wifi → bluetooth)
+      </Text>
+      <Text style={{ color: "#666" }}>
+        Direct device-to-device sync only — no account, no registration. Both devices must hold
+        the same sync key and be on the same Wi-Fi (or in Bluetooth range).
       </Text>
       {(
         [
           ["WiFi LAN (same network, fastest)", "wifiEnabled", K.wifi],
           ["Bluetooth (no WiFi needed)", "bluetoothEnabled", K.bt],
-          ["Cloud relay (works anywhere)", "cloudEnabled", K.cloud],
         ] as [string, keyof TransportPolicy, string][]
       ).map(([label, field, key]) => (
         <Pressable
@@ -126,7 +125,15 @@ export default function Settings() {
             );
             return;
           }
-          await setSyncKeyB64(v);
+          try {
+            await setSyncKeyB64(v);
+          } catch (e) {
+            Alert.alert(
+              "Save failed",
+              `Could not write the key to secure storage: ${String(e)}. The "Sync key missing" banner will keep showing until the key is saved.`,
+            );
+            return;
+          }
           setSavedFp(keyFingerprint(v));
           setSyncKey("");
           Alert.alert("Saved", `Sync key saved. Fingerprint: ${keyFingerprint(v)}`);
@@ -209,7 +216,7 @@ export default function Settings() {
                     await pushEnvelope(
                       item,
                       buildWifiEnvelope({
-                        sender_device_id: (await loadIdentity()).device_id ?? "android-probe",
+                        sender_device_id: await getOrCreateLocalDeviceId(),
                         item: {
                           id: "00000000-0000-4000-8000-000000000000",
                           owner_id: "probe",

@@ -1,46 +1,35 @@
 /**
- * Unified transport policy: wifi-lan → bluetooth → cloud.
+ * Unified transport policy: wifi-lan → bluetooth.
  *
- * Mirrors `pickTransport` in `@ucm/protocol` (lan.ts) and
- * `pick_transport` in `apps/linux/src/transport.rs`. Only capability
- * flags and on/off switches are inspected — never clipboard contents.
+ * Direct device-to-device sync only — no accounts, no phone-number
+ * registration, no cloud relay. Mirrors `pickTransport` in
+ * `@ucm/protocol` (lan.ts) and `pick_transport` in
+ * `apps/linux/src/transport.rs`. Only capability flags and on/off
+ * switches are inspected — never clipboard contents.
  */
 import { healthCheck, listLanPeers, pushEnvelope, type LanPeer, type WifiEnvelope } from "./lan";
 import { getBtStatus, sendEnvelopeViaBt, btOutbox, type BtEnvelope } from "./bluetooth";
-import { api } from "./api";
 import * as SecureStore from "expo-secure-store";
 
-export type Transport = "wifi" | "bluetooth" | "cloud";
+export type Transport = "wifi" | "bluetooth";
 
 export interface TransportPolicy {
   wifiEnabled: boolean;
   bluetoothEnabled: boolean;
-  cloudEnabled: boolean;
 }
 
 export const DEFAULT_POLICY: TransportPolicy = {
   wifiEnabled: true,
   bluetoothEnabled: true,
-  // Direct LAN/BT mesh is the default; the cloud relay is opt-in
-  // (Settings → Cloud relay) for devices off the LAN.
-  cloudEnabled: false,
 };
 
-/** Policy toggles persisted by the Settings screen (wifi/bt on, cloud off unless enabled). */
+/** Policy toggles persisted by the Settings screen (both on unless disabled). */
 export async function loadPolicy(): Promise<TransportPolicy> {
-  const [w, b, c] = await Promise.all([
+  const [w, b] = await Promise.all([
     SecureStore.getItemAsync("ucm.wifi"),
     SecureStore.getItemAsync("ucm.bt"),
-    SecureStore.getItemAsync("ucm.cloud"),
   ]);
-  return { wifiEnabled: w !== "0", bluetoothEnabled: b !== "0", cloudEnabled: c === "1" };
-}
-
-export interface CloudPeer {
-  id: string;
-  name: string;
-  platform: string;
-  capabilities?: string[];
+  return { wifiEnabled: w !== "0", bluetoothEnabled: b !== "0" };
 }
 
 export function pickTransport(
@@ -51,7 +40,6 @@ export function pickTransport(
   const caps = new Set(capabilities);
   if (policy.wifiEnabled && hasWifiRoute && caps.has("wifi-lan")) return "wifi";
   if (policy.bluetoothEnabled && caps.has("bluetooth")) return "bluetooth";
-  if (policy.cloudEnabled) return "cloud";
   return null;
 }
 
@@ -90,19 +78,18 @@ export interface ClipboardPayload {
 }
 
 /**
- * Fan out one already-encrypted item over every enabled transport.
- * Best-effort per link; failures never throw — the caller keeps the
- * offline queue as the backstop (same contract as the Linux engine).
+ * Fan out one already-encrypted item over every enabled transport
+ * (wifi → bluetooth). Best-effort per link; failures never throw —
+ * the caller keeps the offline queue as the backstop (same contract
+ * as the Linux engine).
  */
 export async function fanOut(
-  token: string | null,
   payload: ClipboardPayload,
   policy: TransportPolicy = DEFAULT_POLICY,
-): Promise<{ wifi: number; bluetooth: number; cloud: boolean; errors: string[] }> {
+): Promise<{ wifi: number; bluetooth: number; errors: string[] }> {
   const errors: string[] = [];
   let wifi = 0;
   let bluetooth = 0;
-  let cloud = false;
 
   if (policy.wifiEnabled) {
     const peers: LanPeer[] = listLanPeers();
@@ -165,22 +152,5 @@ export async function fanOut(
     }
   }
 
-  if (policy.cloudEnabled && token) {
-    try {
-      await api.uploadItem(token, {
-        id: payload.id,
-        content_type: payload.content_type,
-        ciphertext: payload.ciphertext,
-        nonce: payload.nonce,
-        metadata: payload.metadata,
-        // AAD-bound: server preserves it verbatim so peers can decrypt.
-        created_at: payload.created_at,
-      });
-      cloud = true;
-    } catch (e) {
-      errors.push(`cloud: ${e}`);
-    }
-  }
-
-  return { wifi, bluetooth, cloud, errors };
+  return { wifi, bluetooth, errors };
 }

@@ -4,8 +4,8 @@
  * Frame format MUST match `packages/protocol/src/lan.ts` and
  * `apps/linux/src/bluetooth.rs`:
  *   `UCM1 <seq>/<total> <base64>` lines, 512B chunks, blank-line terminator.
- * The envelope JSON inside is the same ciphertext the cloud/LAN paths
- * carry — framing adds no crypto, AES-GCM AAD still authenticates.
+ * The envelope JSON inside is the same ciphertext the WiFi LAN path
+ * carries — framing adds no crypto, AES-GCM AAD still authenticates.
  *
  * Runtime: uses `react-native-ble-plx` when the dev build includes it
  * (optional peer dep — never imported statically so Expo Go / typecheck
@@ -99,7 +99,7 @@ export async function getBtStatus(): Promise<BtAvailability> {
       backend: "none",
       detail:
         "Bluetooth needs a dev build with `react-native-ble-plx` (Expo Go has no BLE). " +
-        "WiFi LAN + cloud still work; see docs/wifi-bluetooth.md.",
+        "WiFi LAN still works; see docs/wifi-bluetooth.md.",
     };
   }
 }
