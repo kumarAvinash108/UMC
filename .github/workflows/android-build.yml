@@ -1,0 +1,72 @@
+name: android-build
+
+# Runs the Android build every time code lands on main (i.e. when a PR is
+# merged), plus on demand from the Actions tab ("Run workflow").
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/android/**"
+      - "packages/protocol/**"
+      - ".github/workflows/android-build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI: true
+      EXPO_NO_TELEMETRY: 1
+      # Bundle-time only. The app derives the PC's LAN IP from the Metro
+      # host at runtime; this keeps `expo export` hermetic in CI.
+      EXPO_PUBLIC_SYNC_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "platforms;android-35" "platforms;android-36" "build-tools;35.0.0" "build-tools;36.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install JS deps
+        run: npm ci || npm install
+
+      - name: Android typecheck
+        run: npx tsc --noEmit -p apps/android/tsconfig.json
+
+      - name: Bundle check (expo export)
+        working-directory: apps/android
+        run: npx expo export --clear --platform android
+
+      - name: Generate native project (prebuild)
+        working-directory: apps/android
+        run: npx expo prebuild --non-interactive --platform android
+
+      - name: Build debug APK
+        working-directory: apps/android/android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ucm-android-debug
+          path: apps/android/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
