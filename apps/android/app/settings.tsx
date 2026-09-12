@@ -126,17 +126,21 @@ export default function Settings() {
             return;
           }
           try {
-            await setSyncKeyB64(v);
+            const home = await setSyncKeyB64(v);
+            setSavedFp(keyFingerprint(v));
+            setSyncKey("");
+            Alert.alert(
+              "Saved",
+              home === "fallback"
+                ? `Sync key saved in the app-private database (your phone's secure hardware store refused it). Fingerprint: ${keyFingerprint(v)}`
+                : `Sync key saved. Fingerprint: ${keyFingerprint(v)}`,
+            );
           } catch (e) {
             Alert.alert(
-              "Save failed",
-              `Could not write the key to secure storage: ${String(e)}. The "Sync key missing" banner will keep showing until the key is saved.`,
+              "Couldn't save the key",
+              `Storage failed on this phone: ${String(e)}. Sync stays off until a key is saved.`,
             );
-            return;
           }
-          setSavedFp(keyFingerprint(v));
-          setSyncKey("");
-          Alert.alert("Saved", `Sync key saved. Fingerprint: ${keyFingerprint(v)}`);
         }}
         style={{ padding: 12, backgroundColor: "#111", borderRadius: 8 }}
       >

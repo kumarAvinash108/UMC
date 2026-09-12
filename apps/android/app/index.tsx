@@ -394,7 +394,7 @@ export default function History() {
  */
 function KeyOnboarding({ onDone }: { onDone: () => Promise<void> }) {
   const [draft, setDraft] = useState("");
-  const [fresh, setFresh] = useState<string | null>(null);
+  const [fresh, setFresh] = useState<{ key: string; fallback: boolean } | null>(null);
   const [saving, setSaving] = useState(false);
 
   async function savePasted() {
@@ -408,33 +408,44 @@ function KeyOnboarding({ onDone }: { onDone: () => Promise<void> }) {
     }
     setSaving(true);
     try {
-      await setSyncKeyB64(v);
+      const home = await setSyncKeyB64(v);
+      setDraft("");
+      if (home === "fallback") {
+        Alert.alert(
+          "Saved (with a note)",
+          "Your phone's secure hardware store refused the key, so it is kept in the app-private database instead. Sync works normally.",
+        );
+      }
+      await onDone();
     } catch (e) {
-      Alert.alert("Save failed", `Could not write secure storage: ${String(e)}`);
-      return;
+      Alert.alert("Couldn't save the key", `Storage failed on this phone: ${String(e)}`);
     } finally {
       setSaving(false);
     }
-    setDraft("");
-    await onDone();
   }
 
   async function generate() {
     setSaving(true);
+    let k: string;
     try {
-      const k = generateSyncKeyB64();
-      await setSyncKeyB64(k);
-      setFresh(k);
+      k = generateSyncKeyB64();
     } catch (e) {
-      Alert.alert("Save failed", `Could not write secure storage: ${String(e)}`);
+      Alert.alert("Couldn't create a key", `This phone refused to make random bytes: ${String(e)}`);
+      setSaving(false);
       return;
+    }
+    try {
+      const home = await setSyncKeyB64(k);
+      setFresh({ key: k, fallback: home === "fallback" });
+    } catch (e) {
+      Alert.alert("Couldn't save the key", `Key created, but storage failed on this phone: ${String(e)}`);
     } finally {
       setSaving(false);
     }
   }
 
   async function copyFresh() {
-    if (fresh) await Clipboard.setStringAsync(fresh);
+    if (fresh) await Clipboard.setStringAsync(fresh.key);
   }
 
   return (
@@ -483,11 +494,17 @@ function KeyOnboarding({ onDone }: { onDone: () => Promise<void> }) {
       {fresh && (
         <View style={{ padding: 12, borderWidth: 1, borderColor: "#0a7", borderRadius: 8, gap: 8 }}>
           <Text selectable style={{ fontFamily: "monospace" }}>
-            {fresh}
+            {fresh.key}
           </Text>
           <Text style={{ color: "#666", fontSize: 12 }}>
-            Fingerprint: {keyFingerprint(fresh)} — compare after `ucm key-import` on Linux.
+            Fingerprint: {keyFingerprint(fresh.key)} — compare after `ucm key-import` on Linux.
           </Text>
+          {fresh.fallback && (
+            <Text style={{ color: "#966800", fontSize: 12 }}>
+              Note: your phone's secure hardware store refused the key, so it is kept in the
+              app-private database instead. Sync works normally.
+            </Text>
+          )}
           <View style={{ flexDirection: "row", gap: 8 }}>
             <Pressable
               onPress={() => void copyFresh()}

@@ -139,8 +139,14 @@ function randomBytes(n: number): Uint8Array {
  * Mint a fresh 32-byte E2E sync key (STANDARD base64, 44 chars).
  * Use for first-run onboarding when the user has no Linux key yet —
  * they then run `ucm key-import <key>` on Linux so both sides match.
+ * Throws a descriptive error (instead of a bare TypeError) when the
+ * device offers no secure random generator.
  */
 export function generateSyncKeyB64(): string {
+  const g = (globalThis as { crypto?: { getRandomValues?: unknown } }).crypto;
+  if (!g || typeof g.getRandomValues !== "function") {
+    throw new Error("no secure random generator on this phone (crypto.getRandomValues is missing)");
+  }
   return bytesToBase64(randomBytes(32));
 }
 
